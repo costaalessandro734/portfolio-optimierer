@@ -2311,6 +2311,30 @@ def page_savings():
          "2000 Simulationen mit echten Monatsrenditen deiner Aufteilung (Bootstrap). Die Rate wird jeweils am "
          "Monatsanfang investiert.")
     ch, rp = port_choice(c, "sp_port")
+    if ss.get("tr"):
+        tr = ss.tr
+        plans = detect_plans(tr["df"])
+        act = plans[plans["aktiv"]] if len(plans) else plans
+        ns = net_saving_12m(tr["df"])
+        tot_tr = max(0.0, tr_total(tr))
+        with st.container(border=True):
+            st.markdown("**Aus deinem Trade-Republic-Export übernehmen**")
+            b1, b2, b3 = st.columns(3)
+            if len(act):
+                b1.button(f"Aktive Sparpläne: {eur(act['monatlich'].sum())}/Monat", width="stretch",
+                          on_click=set_ss, kwargs={"sp_rate": float(round(act["monatlich"].sum(), 0))},
+                          help="Summe deiner aktiven Sparpläne, umgerechnet auf einen Monat: " +
+                               ", ".join(f"{n} {eur2(m)}" for n, m in zip(act["name"], act["monatlich"])))
+            else:
+                b1.button("Keine aktiven Sparpläne gefunden", disabled=True, width="stretch",
+                          help="Im Export wurden keine laufenden Sparpläne erkannt.")
+            b2.button(f"Ø Einzahlung: {eur(max(ns, 0))}/Monat", width="stretch", disabled=ns <= 0,
+                      on_click=set_ss, kwargs={"sp_rate": float(round(max(ns, 0), 0))},
+                      help="Deine durchschnittliche Netto-Einzahlung der letzten 12 Monate (Einzahlungen minus "
+                           "Überweisungen raus).")
+            b3.button(f"Startkapital: {eur(tot_tr)}", width="stretch",
+                      on_click=set_ss, kwargs={"sp_start": float(round(tot_tr, -1))},
+                      help="Dein Gesamtvermögen bei Trade Republic (Wertpapiere + Krypto + Cash).")
     a1, a2, a3 = st.columns(3)
     ss.setdefault("sp_start", float(round(c["V"], -1)))
     start_v = a1.number_input("Startkapital (€)", min_value=0.0, step=500.0, key="sp_start",
@@ -2375,6 +2399,20 @@ def page_savings():
     lines.append("Grundlage ist die Vergangenheit deiner Aufteilung (" + ch.lower() + "). Lief diese besonders gut, sind "
                  "die Zahlen zu optimistisch – rechne lieber mit dem schlechten Fall.")
     explain(lines)
+    with st.container(border=True):
+        st.subheader("Und danach? Für die Rente", help="Grobe Faustregel: 3,5 % des Vermögens pro Jahr gelten als "
+                                                      "Entnahme, die über ca. 30 Jahre meist reicht. Genauer rechnet der "
+                                                      "Entnahmeplan.")
+        r1, r2 = st.columns(2)
+        r1.metric("Mögliche Entnahme (mittlerer Fall)", eur(med * 0.035 / 12) + " / Monat",
+                  help=f"3,5 % von {eur(med)} pro Jahr, geteilt durch 12.")
+        r2.metric("Vorsichtig (schlechter Fall)", eur(p5 * 0.035 / 12) + " / Monat",
+                  help=f"3,5 % von {eur(p5)} pro Jahr, geteilt durch 12.")
+        st.button("Mittleren Endwert in den Entnahmeplan übernehmen", icon=":material/payments:",
+                  on_click=set_ss, kwargs={"wd_start": float(round(med, -2)), "wd_rate": float(round(med * 0.035 / 12, -1))},
+                  help="Setzt im Entnahmeplan das Startkapital auf den mittleren Endwert und die Entnahme auf 3,5 % "
+                       "pro Jahr. Danach links im Menü „Entnahmeplan“ öffnen.")
+        st.page_link(P_WD, label="Zum Entnahmeplan", icon=":material/arrow_forward:")
 
 
 # =====================================================================
@@ -2387,6 +2425,11 @@ def page_withdraw():
          "2000 Simulationen mit echten Monatsrenditen deiner Aufteilung. Die Entnahme erfolgt am Monatsanfang. Steuern "
          "auf Entnahmen sind nicht berücksichtigt.")
     ch, rp = port_choice(c, "wd_port")
+    if ss.get("tr"):
+        tt = max(0.0, tr_total(ss.tr))
+        st.button(f"Startkapital = Trade-Republic-Vermögen ({eur(tt)})", on_click=set_ss,
+                  kwargs={"wd_start": float(round(tt, -1))}, icon=":material/account_balance_wallet:",
+                  help="Übernimmt dein Gesamtvermögen aus dem Export (Wertpapiere + Krypto + Cash).")
     a1, a2, a3 = st.columns(3)
     ss.setdefault("wd_start", float(round(c["V"], -1)))
     ss.setdefault("wd_rate", float(max(10, round(c["V"] * 0.035 / 12, -1))))
@@ -2785,7 +2828,8 @@ def analyse_tr(df: pd.DataFrame) -> dict:
                     warn.append(f"{q['name']}: Verkauf von {n:g} Stück, laut Export waren nur {q['qty']:g} im Bestand.")
                 proceeds = r["amount"] + r["fee"]
                 realized.append({"day": r["day"], "symbol": sym, "name": q["name"], "cls": q["cls"], "shares": n,
-                                 "proceeds": proceeds, "cost": cost_out, "gain": proceeds - cost_out, "tax": r["tax"]})
+                                 "proceeds": proceeds, "cost": cost_out, "gain": proceeds - cost_out, "tax": r["tax"],
+                                 "first": q["first"], "closed": q["qty"] - n < 1e-6})
                 q["qty"] -= n
                 q["cost"] -= cost_out
                 if q["qty"] < 1e-9:
@@ -2821,6 +2865,33 @@ def analyse_tr(df: pd.DataFrame) -> dict:
                 q["qty"] += sh
                 warn.append(f"Unbekannte Kapitalmaßnahme {typ} bei {r['name']} – Stückzahl übernommen, Kosten nicht.")
 
+    def bucket(row):
+        t_, c_ = row["type"], row["category"]
+        if c_ == "TRADING":
+            return ("Aktiengeschäft", "Käufe (inkl. Gebühren)" if row["shares"] > 0 else "Verkäufe (netto)")
+        if c_ == "CORPORATE_ACTION":
+            return ("Aktiengeschäft", "Kapitalmaßnahmen")
+        if t_ == "DIVIDEND":
+            return ("Aktiengeschäft", "Dividenden (netto)")
+        if t_ == "STOCKPERK":
+            return ("Aktiengeschäft", "Boni (Stockperks)")
+        if t_ in ("TAX_OPTIMIZATION", "SEC_ACCOUNT"):
+            return ("Aktiengeschäft", "Steuer-Korrekturen")
+        if t_ in INFLOW:
+            return ("Konto", "Einzahlungen")
+        if t_ in OUTFLOW:
+            return ("Konto", "Überweisungen raus")
+        if t_.startswith("CARD"):
+            return ("Konto", "Kartenzahlungen" if t_ == "CARD_TRANSACTION" else "Kartengebühren & -erstattungen")
+        if t_ == "GIFT":
+            return ("Konto", "Geschenke")
+        if t_ == "INTEREST_PAYMENT":
+            return ("Konto", "Zinsen (netto)")
+        return ("Konto", "Sonstiges")
+    bb = df.apply(bucket, axis=1, result_type="expand")
+    df = df.assign(bereich=bb[0], topf=bb[1], effekt=(df["amount"] + df["fee"] + df["tax"]).where(
+        df["category"] != "CORPORATE_ACTION", 0.0))
+
     hold = pd.DataFrame([{"symbol": s, **v} for s, v in pos.items() if v["qty"] > 1e-6])
     real = pd.DataFrame(realized)
     cash = df[df["category"] == "CASH"]
@@ -2840,6 +2911,8 @@ def analyse_tr(df: pd.DataFrame) -> dict:
         "steuern_gesamt": float(df["tax"].sum()),
         "kontostand": float((df["amount"] + df["fee"] + df["tax"]).where(df["category"] != "CORPORATE_ACTION", 0).sum()),
         "start": df["day"].min(), "ende": df["day"].max(), "n": len(df),
+        "aktien_cash": float(df.loc[df["bereich"] == "Aktiengeschäft", "effekt"].sum()),
+        "konto_cash": float(df.loc[df["bereich"] == "Konto", "effekt"].sum()),
     }
     return {"hold": hold, "real": real, "sum": summary, "div": div, "warn": warn, "df": df}
 
@@ -2943,20 +3016,39 @@ def page_tr():
     k3.metric("Krypto", eur(val_cry), help="Kryptowährungen zum aktuellen Kurs in Euro.")
     k4.metric("Guthaben (Cash)", eur(cash), help="Berechneter Kontostand aus allen Buchungen der Datei.")
     gt = total - net_in
+    inv_res = val_sec + val_cry + S_["aktien_cash"]          # Wert heute + alles, was das Aktiengeschäft ein-/ausgezahlt hat
+    paid_in = -tr["df"].loc[tr["df"]["topf"] == "Käufe (inkl. Gebühren)", "effekt"].sum()
+    st.markdown("##### Aktiengeschäft")
     k5, k6, k7, k8 = st.columns(4)
-    k5.metric("Gesamtgewinn", ("+" if gt >= 0 else "−") + eur(abs(gt)),
-              f"{sg(gt / net_in * 100) if net_in > 0 else '–'} % auf eingezahltes Geld",
-              help="Gesamtvermögen minus Netto-Einzahlungen (Einzahlungen − Auszahlungen − Kartenzahlungen). "
-                   "Enthält Kursgewinne, Verkäufe, Dividenden, Zinsen, abzüglich Gebühren und Steuern.")
+    k5.metric("Ergebnis Aktiengeschäft", ("+" if inv_res >= 0 else "−") + eur(abs(inv_res)),
+              f"{sg(inv_res / paid_in * 100) if paid_in > 0 else '–'} % auf alle Käufe",
+              help="Nur dein Investieren: Wert der offenen Positionen + Verkaufserlöse + Dividenden + Boni − alle "
+                   "Käufe (inkl. Gebühren) ± Steuern. Kartenzahlungen, Überweisungen und Zinsen sind NICHT enthalten.")
     real = tr["real"]
     rg = real["gain"].sum() if len(real) else 0.0
     k6.metric("Realisierte Gewinne", ("+" if rg >= 0 else "−") + eur(abs(rg)),
               help="Gewinne/Verluste aus allen Verkäufen, nach Durchschnittskosten-Methode (inkl. Gebühren).")
-    inc = S_["dividenden_brutto"] + S_["dividenden_steuer"] + S_["zinsen_brutto"] + S_["zinsen_steuer"]
-    k7.metric("Dividenden + Zinsen (netto)", eur(inc), help=f"Dividenden {eur(S_['dividenden_brutto'])} und Zinsen "
-              f"{eur(S_['zinsen_brutto'])} brutto, abzüglich einbehaltener Steuern.")
-    k8.metric("Gebühren + Steuern", "−" + eur(-(S_["gebuehren"] + S_["steuern_gesamt"])),
-              help=f"Ordergebühren {eur(-S_['gebuehren'])}, Steuern netto {eur(-S_['steuern_gesamt'])} (inkl. Erstattungen).")
+    divn = S_["dividenden_brutto"] + S_["dividenden_steuer"]
+    k7.metric("Dividenden (netto)", eur(divn), help=f"Dividenden {eur(S_['dividenden_brutto'])} brutto, abzüglich "
+              "einbehaltener Steuern.")
+    tdf = tr["df"]
+    trade_fees = -tdf.loc[tdf["bereich"] == "Aktiengeschäft", "fee"].sum()
+    trade_tax = -tdf.loc[tdf["bereich"] == "Aktiengeschäft", "tax"].sum()
+    k8.metric("Gebühren + Steuern (Handel)", "−" + eur(trade_fees + trade_tax),
+              help=f"Ordergebühren {eur(trade_fees)}, Steuern auf Verkäufe/Dividenden netto {eur(trade_tax)}.")
+    kt = tdf[tdf["bereich"] == "Konto"]
+    with st.container(border=True):
+        st.markdown("##### Konto & Zahlungen (getrennt vom Aktiengeschäft)")
+        z1, z2, z3, z4 = st.columns(4)
+        z1.metric("Eingezahlt", eur(kt.loc[kt["topf"] == "Einzahlungen", "effekt"].sum()),
+                  help="Alle Überweisungen auf dein Trade-Republic-Konto.")
+        z2.metric("Überwiesen raus", "−" + eur(-kt.loc[kt["topf"] == "Überweisungen raus", "effekt"].sum()),
+                  help="Alle Überweisungen von Trade Republic auf andere Konten.")
+        z3.metric("Kartenzahlungen", "−" + eur(-kt.loc[kt["topf"].str.startswith("Karten"), "effekt"].sum()),
+                  help="Ausgaben mit der Trade-Republic-Karte inkl. Kartengebühren.")
+        z4.metric("Zinsen (netto)", eur(kt.loc[kt["topf"] == "Zinsen (netto)", "effekt"].sum()),
+                  help="Zinsen auf dein Guthaben nach Steuern.")
+        st.page_link(P_KONTO, label="Alle Zahlungen im Detail", icon=":material/account_balance:")
 
     cA, cB = st.columns([3, 2], gap="large")
     for col, d, title, colr in ((cA, sec, "Wertpapiere (Aktien, ETFs, Fonds)", "#1240e0"), (cB, cry, "Krypto", "#f7931a")):
@@ -2968,19 +3060,48 @@ def page_tr():
                 continue
             vv, cc = d["value"].fillna(d["cost"]).sum(), d["cost"].sum()
             gg = d["gain"].dropna().sum()
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Wert", eur(vv))
-            m2.metric("Investiert", eur(cc))
-            m3.metric("Gewinn/Verlust", ("+" if gg >= 0 else "−") + eur(abs(gg)), f"{sg(gg / cc * 100) if cc else '–'} %")
             rr = real[(real["cls"] == "CRYPTO") == (title == "Krypto")] if len(real) else real
-            st.caption(f"{len(d)} {'Position' if len(d) == 1 else 'Positionen'} · realisiert bisher: {('+' if rr['gain'].sum() >= 0 else '−') + eur(abs(rr['gain'].sum())) if len(rr) else '0 €'}")
+            rgain = float(rr["gain"].sum()) if len(rr) else 0.0
+            m1, m2 = st.columns(2)
+            m1.metric("Wert heute", eur(vv), help="Offene Positionen zum aktuellen Kurs.")
+            m2.metric("Investiert (offen)", eur(cc), help="Einstandskosten der noch gehaltenen Stücke.")
+            m3, m4 = st.columns(2)
+            m3.metric("Unrealisiert", ("+" if gg >= 0 else "−") + eur(abs(gg)), f"{sg(gg / cc * 100) if cc else '–'} %",
+                      help="Gewinn/Verlust der noch gehaltenen Positionen – nur auf dem Papier.")
+            m4.metric("Realisiert", ("+" if rgain >= 0 else "−") + eur(abs(rgain)),
+                      help="Gewinne und Verluste aus allen bisherigen Verkäufen in diesem Bereich. Details auf der Seite "
+                           "„Realisierte Gewinne“.")
+            st.caption(f"{len(d)} {'Position' if len(d) == 1 else 'Positionen'} offen · {len(rr)} Verkäufe bisher")
     st.subheader("Wie dein Vermögen verteilt ist")
     fd = go.Figure(go.Pie(labels=["Wertpapiere", "Krypto", "Cash"], values=[val_sec, val_cry, max(cash, 0)], hole=0.55,
                           marker=dict(colors=["#1240e0", "#f7931a", "#9aa7c7"]), textinfo="label+percent", sort=False))
     fd.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), showlegend=False, font=dict(size=15), separators=",.")
     st.plotly_chart(fd, width="stretch")
 
-    t1, t2, t3, t4, t5 = st.tabs(["Wertpapiere", "Krypto", "Verkäufe", "Dividenden & Zinsen", "Zuordnung der Kurse"])
+    st.page_link(P_REAL, label="Alle realisierten Gewinne & Verluste im Detail", icon=":material/receipt_long:")
+    t1, t2, t3, t4, t6, t5 = st.tabs(["Wertpapiere", "Krypto", "Verkäufe", "Dividenden & Zinsen", "Sparpläne",
+                                      "Zuordnung der Kurse"])
+    with t6:
+        plans = detect_plans(tr["df"])
+        ns = net_saving_12m(tr["df"])
+        st.metric("Ø Netto-Einzahlung pro Monat (letzte 12 Monate)", eur(ns),
+                  help="Einzahlungen minus Überweisungen raus, geteilt durch 12. Zeigt, wie viel du tatsächlich "
+                       "monatlich zur Seite legst – auch ohne festen Sparplan.")
+        if plans.empty:
+            st.info("In deinem Export wurden keine Sparpläne gefunden – weder als Sparplan markierte Käufe noch "
+                    "regelmäßige Käufe mit gleichem Betrag. Du kannst trotzdem deine Ø Netto-Einzahlung im "
+                    "Sparplan-Rechner verwenden.")
+        else:
+            st.dataframe(pd.DataFrame({
+                "Wertpapier": plans["name"], "Art": np.where(plans["krypto"], "Krypto", "Wertpapier"),
+                "Betrag": [eur2(x) for x in plans["betrag"]], "Rhythmus": plans["rhythmus"],
+                "≈ pro Monat": [eur2(x) for x in plans["monatlich"]], "Ausführungen": plans["ausfuehrungen"],
+                "Seit": [d.strftime("%m/%Y") for d in plans["seit"]], "Status": np.where(plans["aktiv"], "aktiv", "beendet"),
+                "Quelle": plans["quelle"]}), hide_index=True, width="stretch",
+                column_config={"Quelle": st.column_config.TextColumn(
+                    help="„markiert“: im Export als Sparplan gekennzeichnet. „erkannt“: regelmäßige Käufe mit ähnlichem "
+                         "Betrag – prüf, ob das wirklich ein Sparplan ist.")})
+        st.page_link(P_SAVE, label="Im Sparplan-Rechner verwenden", icon=":material/savings:")
     for tab, d in ((t1, sec), (t2, cry)):
         with tab:
             if d.empty:
@@ -3064,8 +3185,12 @@ def page_tr():
         st.page_link(P_DEPOT, label="Zu „Mein Depot“", icon=":material/arrow_forward:")
     lines = [f"Dein Gesamtvermögen bei Trade Republic beträgt rund **{eur(total)}**: {pc(val_sec / total if total else 0, 0)} "
              f"Wertpapiere, {pc(val_cry / total if total else 0, 0)} Krypto, {pc(cash / total if total else 0, 0)} Cash.",
-             f"Du hast netto **{eur(net_in)}** eingezahlt (Einzahlungen minus Auszahlungen und Kartenzahlungen). Daraus "
-             f"wurden {eur(total)} – ein Gesamtgewinn von **{('+' if gt >= 0 else '−')}{eur(abs(gt))}**."]
+             f"Dein **Aktiengeschäft** hat bisher **{('+' if inv_res >= 0 else '−')}{eur(abs(inv_res))}** gebracht "
+             f"(offene Positionen, Verkäufe, Dividenden und Boni gegen alle Käufe gerechnet) – unabhängig davon, was du "
+             "mit Karte bezahlt oder überwiesen hast.",
+             f"Über das Konto sind netto **{eur(S_['konto_cash'])}** ins Investieren geflossen (Einzahlungen minus "
+             "Überweisungen raus und Kartenzahlungen, plus Zinsen). Diese Bewegungen findest du getrennt auf "
+             "**Konto & Zahlungen**."]
     if len(sec):
         best = sec.loc[sec["gain"].fillna(-1e18).idxmax()]
         worst = sec.loc[sec["gain"].fillna(1e18).idxmin()]
@@ -3081,12 +3206,371 @@ def page_tr():
     explain(lines)
 
 
+
+
+# =====================================================================
+# Seite: Realisierte Gewinne & Verluste
+# =====================================================================
+def real_block(rr, title, color):
+    """Kennzahlen + Tabelle für einen Bereich (Wertpapiere oder Krypto)."""
+    win, los = rr[rr["gain"] > 0], rr[rr["gain"] < 0]
+    tot = rr["gain"].sum()
+    with st.container(border=True):
+        st.subheader(title)
+        a, b = st.columns(2)
+        a.metric("Realisiert gesamt", ("+" if tot >= 0 else "−") + eur(abs(tot)),
+                 f"{sg(tot / rr['cost'].sum() * 100) if rr['cost'].sum() else '–'} % auf den Einstand",
+                 help="Summe aller Gewinne und Verluste aus Verkäufen.")
+        b.metric("Trefferquote", pc(len(win) / len(rr), 0) if len(rr) else "–",
+                 help="Anteil der Verkäufe mit Gewinn.")
+        c, d = st.columns(2)
+        c.metric("Summe Gewinne", "+" + eur(win["gain"].sum()), help=f"{len(win)} Verkäufe mit Gewinn.")
+        d.metric("Summe Verluste", ("−" + eur(abs(los["gain"].sum()))) if len(los) else "0 €",
+                 help=f"{len(los)} Verkäufe mit Verlust.")
+
+
+def page_real():
+    head("Realisierte Gewinne & Verluste", "Was du mit deinen Verkäufen tatsächlich verdient oder verloren hast – "
+                                          "Wertpapiere und Krypto getrennt.",
+         "Berechnet aus deinem Trade-Republic-Export mit der Durchschnittskosten-Methode (inkl. Kauf- und "
+         "Verkaufsgebühren). Realisiert heißt: Der Gewinn oder Verlust ist durch den Verkauf „echt“ geworden.")
+    tr = ss.get("tr")
+    if not tr:
+        st.info("Lade zuerst deinen Transaktionsexport auf der Seite **Trade-Republic-Import** hoch.")
+        st.page_link(P_TR, label="Zum Trade-Republic-Import", icon=":material/upload_file:")
+        return
+    real = tr["real"].copy()
+    if not len(real):
+        st.info("In deinem Export gibt es noch keine Verkäufe.")
+        return
+    real["Art"] = np.where(real["cls"] == "CRYPTO", "Krypto", "Wertpapiere")
+    real["tage"] = (real["day"] - real["first"]).dt.days
+    real["pct"] = real["gain"] / real["cost"].where(real["cost"] > 0)
+    tot = real["gain"].sum()
+    S_ = tr["sum"]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Realisiert insgesamt", ("+" if tot >= 0 else "−") + eur(abs(tot)),
+              help="Alle Verkäufe seit Kontoeröffnung, Wertpapiere und Krypto zusammen.")
+    k2.metric("Anzahl Verkäufe", f"{len(real)}", help="Teilverkäufe zählen einzeln.")
+    k3.metric("Bester Verkauf", "+" + eur(real["gain"].max()), real.loc[real["gain"].idxmax(), "name"],
+              delta_color="off")
+    k4.metric("Schlechtester Verkauf", ("+" if real["gain"].min() >= 0 else "−") + eur(abs(real["gain"].min())),
+              real.loc[real["gain"].idxmin(), "name"], delta_color="off")
+    cA, cB = st.columns(2, gap="large")
+    with cA:
+        real_block(real[real["Art"] == "Wertpapiere"], "Wertpapiere", "#1240e0")
+    with cB:
+        if (real["Art"] == "Krypto").any():
+            real_block(real[real["Art"] == "Krypto"], "Krypto", "#f7931a")
+        else:
+            st.container(border=True).caption("Keine Krypto-Verkäufe.")
+
+    t1, t2, t3, t4, t5 = st.tabs(["Nach Wertpapier", "Pro Jahr", "Verlauf", "Alle Verkäufe", "Gesamtergebnis"])
+    with t1:
+        g = real.groupby(["name", "Art"]).agg(verk=("gain", "size"), erl=("proceeds", "sum"), ein=("cost", "sum"),
+                                              gew=("gain", "sum"), closed=("closed", "max"),
+                                              tage=("tage", "mean")).reset_index().sort_values("gew")
+        st.subheader("Gewinn/Verlust je Wertpapier", help="Alle Verkäufe eines Wertpapiers zusammengefasst.")
+        fg = go.Figure(go.Bar(y=g["name"], x=g["gew"], orientation="h",
+                              marker_color=["#0b7a3b" if x >= 0 else "#e8361b" for x in g["gew"]],
+                              text=[("+" if x >= 0 else "−") + eur(abs(x)) for x in g["gew"]], textposition="outside"))
+        fg.update_layout(height=80 + 30 * len(g), margin=dict(l=10, r=60, t=10, b=10), xaxis_title="€",
+                         separators=",.", font=dict(size=14))
+        st.plotly_chart(fg, width="stretch")
+        held = set(tr["hold"]["symbol"]) if len(tr["hold"]) else set()
+        names_held = set(tr["hold"]["name"]) if len(tr["hold"]) else set()
+        TC = st.column_config.TextColumn
+        st.dataframe(pd.DataFrame({
+            "Wertpapier": g["name"], "Art": g["Art"], "Verkäufe": g["verk"],
+            "Erlös": [eur2(x) for x in g["erl"]], "Einstand": [eur2(x) for x in g["ein"]],
+            "Gewinn/Verlust": [("+" if x >= 0 else "−") + eur2(abs(x)) for x in g["gew"]],
+            "in %": [(("+" if x > 0 else "") + de(x / e * 100) + " %") if e > 0 else "–" for x, e in zip(g["gew"], g["ein"])],
+            "Ø Haltedauer": [f"{de(t / 30.44, 0)} Monate" if t == t else "–" for t in g["tage"]],
+            "Status": ["noch im Depot" if n in names_held else "komplett verkauft" for n in g["name"]]}).iloc[::-1],
+            hide_index=True, width="stretch", height=min(800, 42 + 36 * len(g)),
+            column_config={"Ø Haltedauer": TC(help="Durchschnittliche Zeit vom ersten Kauf bis zum Verkauf."),
+                           "Status": TC(help="Ob du noch Stücke dieses Wertpapiers hältst.")})
+    with t2:
+        real["Jahr"] = real["day"].dt.year
+        pv = real.pivot_table(index="Jahr", columns="Art", values="gain", aggfunc="sum").fillna(0)
+        st.subheader("Realisiert pro Jahr", help="Wichtig für die Steuer: Gewinne und Verluste werden pro Kalenderjahr "
+                                                 "verrechnet. In Deutschland sind 1.000 € pro Jahr (Sparer-Pauschbetrag) "
+                                                 "steuerfrei, wenn ein Freistellungsauftrag vorliegt.")
+        fy = go.Figure([go.Bar(x=pv.index.astype(str), y=pv[c], name=c,
+                               marker_color="#f7931a" if c == "Krypto" else "#1240e0",
+                               text=[("+" if v_ >= 0 else "−") + eur(abs(v_)) for v_ in pv[c]], textposition="outside")
+                        for c in pv.columns])
+        fy.update_layout(barmode="group", height=400, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="€",
+                         separators=",.", legend=dict(orientation="h", y=1.12), font=dict(size=15))
+        st.plotly_chart(fy, width="stretch")
+        yt = real.groupby("Jahr").agg(g=("gain", lambda s: s[s > 0].sum()), l=("gain", lambda s: s[s < 0].sum()),
+                                      n=("gain", "size"), t=("tax", "sum"))
+        st.dataframe(pd.DataFrame({"Jahr": yt.index.astype(str), "Verkäufe": yt["n"],
+                                   "Gewinne": ["+" + eur2(x) for x in yt["g"]], "Verluste": ["−" + eur2(-x) for x in yt["l"]],
+                                   "Saldo": [("+" if x >= 0 else "−") + eur2(abs(x)) for x in yt["g"] + yt["l"]],
+                                   "Steuer bei Verkauf": [eur2(-x) if x else "–" for x in yt["t"]]}),
+                     hide_index=True, width="stretch")
+    with t3:
+        rs = real.sort_values("day")
+        st.subheader("Realisierte Gewinne über die Zeit", help="Aufsummiert: Wie sich dein realisiertes Ergebnis mit "
+                                                              "jedem Verkauf entwickelt hat.")
+        fc = go.Figure()
+        for art, col in (("Wertpapiere", "#1240e0"), ("Krypto", "#f7931a")):
+            s_ = rs[rs["Art"] == art]
+            if len(s_):
+                fc.add_scatter(x=s_["day"], y=s_["gain"].cumsum(), name=art, mode="lines+markers", line=dict(color=col, width=3),
+                               line_shape="hv", text=s_["name"], hovertemplate="%{text}<br>%{x|%d.%m.%Y}: %{y:,.0f} €")
+        fc.add_scatter(x=rs["day"], y=rs["gain"].cumsum(), name="Gesamt", line=dict(color="#555", width=2, dash="dash"),
+                       line_shape="hv")
+        fc.update_layout(height=440, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€", separators=",.",
+                         legend=dict(orientation="h", y=1.08), font=dict(size=15))
+        st.plotly_chart(fc, width="stretch")
+    with t4:
+        rr = real.sort_values("day", ascending=False)
+        st.dataframe(pd.DataFrame({
+            "Datum": rr["day"].dt.strftime("%d.%m.%Y"), "Wertpapier": rr["name"], "Art": rr["Art"],
+            "Stück": [de(x, 4) for x in rr["shares"]], "Erlös": [eur2(x) for x in rr["proceeds"]],
+            "Einstand": [eur2(x) for x in rr["cost"]],
+            "Gewinn/Verlust": [("+" if x >= 0 else "−") + eur2(abs(x)) for x in rr["gain"]],
+            "in %": [(("+" if x > 0 else "") + de(x * 100) + " %") if x == x else "–" for x in rr["pct"]],
+            "Gehalten": [f"{int(t)} Tage" if t == t else "–" for t in rr["tage"]],
+            "Krypto > 1 Jahr": [("ja" if t > 365 else "nein") if a_ == "Krypto" and t == t else "" for t, a_ in
+                                zip(rr["tage"], rr["Art"])]}),
+            hide_index=True, width="stretch", height=600,
+            column_config={"Krypto > 1 Jahr": st.column_config.TextColumn(
+                help="In Deutschland sind Krypto-Gewinne nach über einem Jahr Haltedauer steuerfrei. Grobe Angabe ab "
+                     "dem ersten Kauf – maßgeblich ist FIFO, prüfe das im Zweifel.")})
+    with t5:
+        hold = tr["hold"]
+        v = tr_valuation(tr) if len(hold) else pd.DataFrame(columns=["gain"])
+        unreal = float(v["gain"].dropna().sum()) if len(v) else 0.0
+        divn = S_["dividenden_brutto"]
+        zins = S_["zinsen_brutto"]
+        fees = S_["gebuehren"]
+        tax = S_["steuern_gesamt"]
+        st.subheader("Woraus sich dein Gesamtergebnis zusammensetzt",
+                     help="Realisiert + unrealisiert + Dividenden + Zinsen + Boni, abzüglich Gebühren und Steuern. Die "
+                          "Gebühren für Käufe/Verkäufe stecken bereits in den Gewinnen und werden hier nicht doppelt "
+                          "abgezogen.")
+        parts = [("Realisiert", tot), ("Unrealisiert", unreal), ("Dividenden", divn), ("Zinsen", zins),
+                 ("Boni", S_["boni"]), ("Steuern", tax), ("Sonstige Gebühren", S_.get("sonst_gebuehren", 0.0))]
+        parts = [(n, x) for n, x in parts if abs(x) > 0.005]
+        fw = go.Figure(go.Waterfall(x=[n for n, _ in parts] + ["Gesamt"], y=[x for _, x in parts] + [0],
+                                    measure=["relative"] * len(parts) + ["total"],
+                                    text=[("+" if x >= 0 else "−") + eur(abs(x)) for _, x in parts] +
+                                         [("+" if sum(x for _, x in parts) >= 0 else "−") + eur(abs(sum(x for _, x in parts)))],
+                                    textposition="outside", increasing=dict(marker_color="#0b7a3b"),
+                                    decreasing=dict(marker_color="#e8361b"), totals=dict(marker_color="#1240e0")))
+        fw.update_layout(height=440, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="€", separators=",.",
+                         font=dict(size=15))
+        st.plotly_chart(fw, width="stretch")
+        st.caption(f"Ordergebühren insgesamt: {eur2(-fees)} – bereits in den Gewinnen/Einstandskosten enthalten.")
+
+    win, los = real[real["gain"] > 0], real[real["gain"] < 0]
+    lines = [f"Mit **{len(real)} Verkäufen** hast du insgesamt **{('+' if tot >= 0 else '−')}{eur(abs(tot))}** "
+             f"realisiert: {eur(win['gain'].sum())} Gewinne aus {len(win)} Verkäufen, {eur(-los['gain'].sum())} Verluste "
+             f"aus {len(los)} Verkäufen."]
+    if len(win) and len(los):
+        aw, al = win["pct"].mean(), los["pct"].mean()
+        lines.append(f"Im Schnitt hast du Gewinner mit **+{de(aw * 100, 0)} %** verkauft und Verlierer mit "
+                     f"**{de(al * 100, 0)} %**. " + (
+                         "Deine Gewinner bringen deutlich mehr, als die Verlierer kosten – gut so."
+                         if aw > -al * 1.5 else
+                         "Gewinne und Verluste sind ähnlich groß. Ein bekanntes Muster ist, Gewinner zu früh zu "
+                         "verkaufen und Verlierer zu lange zu halten (Dispositionseffekt) – prüf, ob das auf dich zutrifft."))
+        hw, hl = win["tage"].median(), los["tage"].median()
+        if hw == hw and hl == hl:
+            lines.append(f"Gewinner hast du im Mittel nach **{de(hw / 30.44, 0)} Monaten** verkauft, Verlierer nach "
+                         f"**{de(hl / 30.44, 0)} Monaten**." + (" Verlierer hältst du also länger als Gewinner."
+                                                               if hl > hw * 1.3 else ""))
+    best = real.loc[real["gain"].idxmax()]
+    lines.append(f"Dein bester Verkauf: **{best['name']}** am {best['day'].strftime('%d.%m.%Y')} mit "
+                 f"+{eur(best['gain'])}.")
+    cr = real[real["Art"] == "Krypto"]
+    if len(cr):
+        short = cr[cr["tage"] <= 365]
+        if len(short):
+            lines.append(f"{len(short)} Krypto-Verkäufe lagen innerhalb eines Jahres nach dem ersten Kauf – deren "
+                         f"Gewinne ({eur(short['gain'].sum())}) sind in Deutschland grundsätzlich steuerpflichtig "
+                         "(Freigrenze 1.000 € pro Jahr für private Veräußerungsgeschäfte).")
+    lines.append("Hinweis: Die App rechnet mit Durchschnittskosten wie die Trade-Republic-App. Das Finanzamt nutzt bei "
+                 "Aktien FIFO – einzelne Werte können abweichen. Für die Steuer zählen die Jahressteuerbescheinigungen.")
+    explain(lines)
+
+
+
+
+# =====================================================================
+# Seite: Konto & Zahlungen
+# =====================================================================
+def page_konto():
+    head("Konto & Zahlungen", "Alles, was nicht zum Aktiengeschäft gehört: Einzahlungen, Überweisungen, Kartenzahlungen, "
+                              "Geschenke und Zinsen – sauber getrennt von deinen Investments.",
+         "Aus deinem Trade-Republic-Export. IBANs und Verwendungszwecke werden nicht angezeigt.")
+    tr = ss.get("tr")
+    if not tr:
+        st.info("Lade zuerst deinen Transaktionsexport auf der Seite **Trade-Republic-Import** hoch.")
+        st.page_link(P_TR, label="Zum Trade-Republic-Import", icon=":material/upload_file:")
+        return
+    df = tr["df"]
+    kt = df[df["bereich"] == "Konto"].copy()
+    S_ = tr["sum"]
+    tot = lambda t_: float(kt.loc[kt["topf"] == t_, "effekt"].sum())
+    card = kt[kt["topf"].str.startswith("Karten")]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Eingezahlt", eur(tot("Einzahlungen")), f"{int((kt['topf'] == 'Einzahlungen').sum())} Überweisungen",
+              delta_color="off", help="Alle Einzahlungen auf dein Trade-Republic-Konto.")
+    k2.metric("Überwiesen raus", "−" + eur(-tot("Überweisungen raus")),
+              f"{int((kt['topf'] == 'Überweisungen raus').sum())} Überweisungen", delta_color="off",
+              help="Alle Überweisungen auf andere Konten.")
+    k3.metric("Mit Karte bezahlt", "−" + eur(-card["effekt"].sum()), f"{int((kt['topf'] == 'Kartenzahlungen').sum())} Zahlungen",
+              delta_color="off", help="Kartenzahlungen inkl. Kartengebühren.")
+    k4.metric("Zinsen (netto)", eur(tot("Zinsen (netto)")), help="Zinsen aufs Guthaben nach Steuern.")
+
+    kt["Monat"] = kt["day"].dt.to_period("M").dt.to_timestamp()
+    st.subheader("Geldflüsse pro Monat", help="Grün = Geld kommt aufs Konto, Rot = Überweisungen raus, Orange = Karte.")
+    fg = go.Figure()
+    for topf, col in (("Einzahlungen", "#0b7a3b"), ("Überweisungen raus", "#e8361b"), ("Kartenzahlungen", "#f7931a"),
+                      ("Zinsen (netto)", "#1240e0"), ("Geschenke", "#9aa7c7")):
+        s_ = kt[kt["topf"] == topf].groupby("Monat")["effekt"].sum()
+        if len(s_):
+            fg.add_bar(x=s_.index, y=s_.values, name=topf, marker_color=col)
+    fg.update_layout(barmode="relative", height=420, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€",
+                     separators=",.", legend=dict(orientation="h", y=1.1), font=dict(size=15))
+    st.plotly_chart(fg, width="stretch")
+
+    t1, t2, t3, t4 = st.tabs(["Kartenzahlungen", "Überweisungen", "Zinsen", "Wie dein Kontostand zustande kommt"])
+    with t1:
+        cz = kt[kt["topf"] == "Kartenzahlungen"].sort_values("day", ascending=False)
+        if not len(cz):
+            st.caption("Keine Kartenzahlungen.")
+        else:
+            st.dataframe(pd.DataFrame({"Datum": cz["day"].dt.strftime("%d.%m.%Y"),
+                                       "Händler": [n.strip() or "–" for n in cz["name"]],
+                                       "Betrag": [("−" if x < 0 else "+") + eur2(abs(x)) for x in cz["effekt"]]}),
+                         hide_index=True, width="stretch")
+            top = cz.groupby(cz["name"].str.strip())["effekt"].sum().sort_values().head(10)
+            st.caption("Größte Ausgaben nach Händler: " + ", ".join(f"{n or '–'} ({eur(-x)})" for n, x in top.items()))
+    with t2:
+        tf = kt[kt["topf"].isin(["Einzahlungen", "Überweisungen raus", "Geschenke"])].sort_values("day", ascending=False)
+        st.dataframe(pd.DataFrame({"Datum": tf["day"].dt.strftime("%d.%m.%Y"),
+                                   "Art": tf["topf"].replace({"Einzahlungen": "Einzahlung", "Überweisungen raus": "Überweisung raus",
+                                                              "Geschenke": "Geschenk"}),
+                                   "Betrag": [("−" if x < 0 else "+") + eur2(abs(x)) for x in tf["effekt"]]}),
+                     hide_index=True, width="stretch", height=480)
+        yy = kt[kt["topf"].isin(["Einzahlungen", "Überweisungen raus"])].groupby([kt["day"].dt.year, "topf"])["effekt"].sum().unstack(fill_value=0)
+        if len(yy):
+            yy["Netto"] = yy.sum(axis=1)
+            st.dataframe(pd.DataFrame({"Jahr": yy.index.astype(str), **{c: [eur(x) for x in yy[c]] for c in yy.columns}}),
+                         hide_index=True, width="stretch")
+    with t3:
+        zi = kt[kt["topf"] == "Zinsen (netto)"]
+        if len(zi):
+            zz = zi.groupby(zi["day"].dt.year)[["amount", "tax"]].sum()
+            st.dataframe(pd.DataFrame({"Jahr": zz.index.astype(str), "Zinsen brutto": [eur2(x) for x in zz["amount"]],
+                                       "Steuer": [eur2(-x) for x in zz["tax"]],
+                                       "Netto": [eur2(x) for x in zz["amount"] + zz["tax"]]}),
+                         hide_index=True, width="stretch")
+        else:
+            st.caption("Keine Zinsen.")
+    with t4:
+        st.subheader("Vom ersten bis zum letzten Euro", help="Alle Buchungen in Töpfe sortiert. Die Summe ergibt genau "
+                                                           "deinen heutigen Kontostand (Cash).")
+        g = df.groupby(["bereich", "topf"])["effekt"].sum()
+        g = g[g.abs() > 0.004]
+        order = [k for k in g.index if k[0] == "Konto"] + [k for k in g.index if k[0] == "Aktiengeschäft"]
+        fw = go.Figure(go.Waterfall(
+            x=[f"{t_}" for _, t_ in order] + ["Kontostand"], y=[g[k] for k in order] + [0],
+            measure=["relative"] * len(order) + ["total"],
+            text=[("+" if g[k] >= 0 else "−") + eur(abs(g[k])) for k in order] + [eur(S_["kontostand"])],
+            textposition="outside", increasing=dict(marker_color="#0b7a3b"), decreasing=dict(marker_color="#e8361b"),
+            totals=dict(marker_color="#1240e0")))
+        fw.update_layout(height=480, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="€", separators=",.",
+                         font=dict(size=13))
+        st.plotly_chart(fw, width="stretch")
+        st.dataframe(pd.DataFrame({"Bereich": [b for b, _ in order], "Topf": [t_ for _, t_ in order],
+                                   "Summe": [("+" if g[k] >= 0 else "−") + eur2(abs(g[k])) for k in order]}),
+                     hide_index=True, width="stretch")
+    konto_net = S_["konto_cash"]
+    explain([
+        f"Du hast **{eur(tot('Einzahlungen'))}** eingezahlt und **{eur(-tot('Überweisungen raus'))}** wieder auf andere "
+        f"Konten überwiesen. Mit der Karte hast du **{eur(-card['effekt'].sum())}** ausgegeben.",
+        f"Für das Aktiengeschäft standen damit netto {eur(konto_net)} zur Verfügung (inklusive {eur(tot('Zinsen (netto)'))} "
+        "Zinsen). Diese Bewegungen beeinflussen dein Anlageergebnis nicht – sie sind nur Geld, das kommt und geht.",
+        f"Dein Kontostand von **{eur(S_['kontostand'])}** ergibt sich aus diesen Zahlungen plus allem, was das "
+        "Aktiengeschäft ein- und ausgezahlt hat (Reiter „Wie dein Kontostand zustande kommt“).",
+    ])
+
+
+
+
+# =====================================================================
+# Sparpläne aus dem Trade-Republic-Export erkennen
+# =====================================================================
+def detect_plans(df):
+    """Ausdrücklich markierte Sparpläne + regelmäßige Käufe (gleicher Wert, ähnlicher Betrag, fester Rhythmus)."""
+    b = df[(df["category"] == "TRADING") & (df["shares"] > 0)].copy()
+    if b.empty:
+        return pd.DataFrame()
+    desc = b.get("description", pd.Series("", index=b.index)).fillna("")
+    b["explicit"] = b["type"].str.contains("SAVING", case=False) | desc.str.contains("savings plan|sparplan", case=False)
+    end_ = df["day"].max()
+    out = []
+    for sym, g in b.groupby("symbol"):
+        explicit = bool(g["explicit"].any())
+        src = g[g["explicit"]] if explicit else g
+        daily = src.groupby(src["day"].dt.normalize())["amount"].sum().abs().sort_index()   # Teilstücke zusammenfassen
+        if len(daily) < (2 if explicit else 3):
+            continue
+        dates = pd.Series(daily.index)
+        # längste zusammenhängende Serie am Ende mit regelmäßigem Abstand und ähnlichem Betrag
+        k = len(daily) - 1
+        while k > 0:
+            gap = (dates.iloc[k] - dates.iloc[k - 1]).days
+            med = daily.iloc[k - 1:].median()
+            if not (5 <= gap <= 40) or abs(daily.iloc[k - 1] - med) > 0.15 * med:
+                break
+            k -= 1
+        run = daily.iloc[k:]
+        if len(run) < (2 if explicit else 3):
+            continue
+        gap = float(pd.Series(run.index).diff().dt.days.dropna().median())
+        amt = float(run.iloc[-3:].median())
+        rhythm = ("wöchentlich" if gap < 10 else "alle 2 Wochen" if gap < 20 else "monatlich" if gap < 45
+                  else "vierteljährlich")
+        active = (end_ - run.index[-1]).days <= 1.6 * gap + 5
+        out.append({"symbol": sym, "name": g["name"].iloc[0].strip(), "krypto": g["asset_class"].iloc[0] == "CRYPTO",
+                    "betrag": amt, "rhythmus": rhythm, "monatlich": amt * 30.44 / gap, "ausfuehrungen": len(run),
+                    "seit": run.index[0], "zuletzt": run.index[-1], "aktiv": active,
+                    "quelle": "als Sparplan markiert" if explicit else "erkannt (regelmäßige Käufe)"})
+    return pd.DataFrame(out)
+
+
+def net_saving_12m(df):
+    """Ø monatliche Netto-Einzahlung (Einzahlungen − Überweisungen raus) der letzten 12 Monate."""
+    end_ = df["day"].max()
+    last = df[(df["day"] > end_ - pd.Timedelta(days=365)) & df["topf"].isin(["Einzahlungen", "Überweisungen raus"])]
+    return float(last["effekt"].sum()) / 12
+
+
+def tr_total(tr):
+    v = tr_valuation(tr)
+    return float(v["value"].fillna(v["cost"]).sum() + tr["sum"]["kontostand"]) if len(v) else float(tr["sum"]["kontostand"])
+
+
+def set_ss(**kw):
+    for k, v in kw.items():
+        ss[k] = v
+
+
 # =====================================================================
 # Menü
 # =====================================================================
 P_INPUT = st.Page(page_input, title="Mein Portfolio", icon=":material/edit:", url_path="portfolio", default=True)
 P_DEPOT = st.Page(page_depot, title="Mein Depot", icon=":material/account_balance_wallet:", url_path="depot")
 P_TR = st.Page(page_tr, title="Trade-Republic-Import", icon=":material/upload_file:", url_path="trade-republic")
+P_REAL = st.Page(page_real, title="Realisierte Gewinne", icon=":material/receipt_long:", url_path="realisiert")
+P_KONTO = st.Page(page_konto, title="Konto & Zahlungen", icon=":material/account_balance:", url_path="konto")
 P_OVER = st.Page(page_overview, title="Übersicht & Vorschlag", icon=":material/dashboard:", url_path="uebersicht")
 P_GROWTH = st.Page(page_growth, title="Wertentwicklung", icon=":material/show_chart:", url_path="wertentwicklung")
 P_ASSETS = st.Page(page_assets, title="Meine Wertpapiere", icon=":material/list_alt:", url_path="wertpapiere")
@@ -3107,7 +3591,7 @@ P_DIV = st.Page(page_div, title="Dividenden", icon=":material/paid:", url_path="
 P_PDF = st.Page(page_report, title="PDF-Bericht", icon=":material/picture_as_pdf:", url_path="bericht")
 P_NEWS = st.Page(page_news, title="Nachrichten", icon=":material/newspaper:", url_path="nachrichten")
 
-menu = {"Start": [P_INPUT, P_TR, P_DEPOT, P_OVER],
+menu = {"Start": [P_INPUT, P_TR, P_REAL, P_KONTO, P_DEPOT, P_OVER],
         "Simulationen & Analysen": [P_GROWTH, P_ASSETS, P_RISK, P_FUTURE, P_CHECK],
         "Planen & Testen": [P_STRESS, P_VSM, P_SAVE, P_WD, P_DIV],
         "Infos & Ideen": [P_IMPROVE, P_INFO, P_NEWS]}
