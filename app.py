@@ -340,7 +340,12 @@ def cached_many(kind, keys, fn, ttl, fail_ttl=3600):
 def hist_missing(tickers):
     box = _store().get("hist", {})
     now = time.time()
-    return [t for t in tickers if t not in box or now - box[t][0] > (12 * 3600 if box[t][1] is not None else box[t][2])]
+    def old(e):
+        if not isinstance(e, tuple) or len(e) < 2:
+            return True
+        ttl = 12 * 3600 if e[1] is not None else (e[2] if len(e) > 2 else 600)
+        return now - e[0] > ttl
+    return [t for t in tickers if t not in box or old(box[t])]
 
 
 def hist_many(tickers):
