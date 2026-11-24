@@ -96,6 +96,29 @@ button[data-baseweb="tab"] p { font-size: 1.05rem; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
+try:
+    DARK = (st.context.theme.type == "dark")
+except Exception:
+    DARK = False
+if DARK:
+    PRI_L = "#3A5A9E"          # „Jetzt“-Balken: auf dunklem Grund nicht zu grell
+    PRI_A, SEC_A = "rgba(79,139,255,0.30)", "rgba(15,181,186,0.30)"   # Unsicherheitsflächen kräftiger
+    st.markdown("""
+<style>
+.hero { background: linear-gradient(120deg, #142A6B 0%, #2558D9 55%, #0C9FA4 100%);
+  box-shadow: 0 18px 40px -22px rgba(0,0,0,.9); }
+.hero::after { background: rgba(255,255,255,.07); }
+[data-testid="stMetric"] { background: rgba(79,139,255,.10); border-color: rgba(79,139,255,.28); }
+[data-testid="stMetric"]:hover { box-shadow: 0 8px 22px -12px rgba(0,0,0,.8); }
+[class*="st-key-explain"] { background: linear-gradient(135deg, rgba(15,181,186,.16), rgba(79,139,255,.08)); }
+[data-testid="stDataFrame"], [data-testid="stDataEditor"] { border-color: rgba(79,139,255,.25); }
+[data-testid="stPageLink"] a { border-color: rgba(79,139,255,.30); }
+[data-testid="stPageLink"] a:hover { background: rgba(79,139,255,.14); }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, rgba(79,139,255,.10) 0%, rgba(15,181,186,.06) 100%);
+  border-right-color: rgba(79,139,255,.20); }
+</style>
+""", unsafe_allow_html=True)
+
 # =====================================================================
 # Deutsche Zahlenformate
 # =====================================================================
@@ -3838,6 +3861,8 @@ if expert:
 menu["Bericht & Hilfe"] = [P_PDF, P_HELP]
 pg = st.navigation(menu, expanded=True)
 pg.run()
+st.sidebar.caption((":material/dark_mode: Dunkles Design aktiv." if DARK else ":material/light_mode: Helles Design aktiv.")
+                   + " Umschalten: Menü **⋮** oben rechts → **Settings** → **Theme**.")
 with st.sidebar.expander("Depot speichern & laden", icon=":material/save:"):
     st.caption("Deine Eingaben werden nicht auf dem Server gespeichert. Sichere sie als Datei und lade sie beim "
                "nächsten Besuch wieder hoch.")
