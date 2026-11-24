@@ -496,6 +496,120 @@ if moves:
                "Vergangenheit dieses Werts setzt. Genau davor schützt die Grenze.") if capped and target == "Max-Sharpe" else ""]
 explain(lines)
 
+# =====================================================================
+# Statistiken im Detail (für alle)
+# =====================================================================
+st.header("Statistiken im Detail")
+st.caption("Tipp: Fahr mit der Maus über das ? neben Überschriften und Spalten, dann erscheint eine Erklärung.")
+tg = st.tabs(["Wertentwicklung", "Deine Wertpapiere", "Jahr für Jahr", "Wer bringt das Risiko?", "Zusammenhänge"])
+dates = R.index.to_timestamp()
+rp_c, rp_t = R.values @ cur, R.values @ tw
+names = [label(t) for t in assets]
+
+with tg[0]:
+    st.subheader("So hätte sich dein Geld entwickelt",
+                 help=f"Angenommen, du hättest vor {T} Monaten {eur(V)} so angelegt wie heute (rot) bzw. wie im "
+                      "Vorschlag (blau) und jeden Monat auf die gleiche Aufteilung zurückgesetzt. Achtung: Der "
+                      "Vorschlag kennt diese Vergangenheit bereits und sieht deshalb hier besonders gut aus.")
+    vc, vt = V * np.cumprod(1 + rp_c), V * np.cumprod(1 + rp_t)
+    f1 = go.Figure()
+    f1.add_scatter(x=dates, y=vc, name="Jetziges Portfolio", line=dict(color="#e8361b", width=2.5))
+    f1.add_scatter(x=dates, y=vt, name="Vorschlag", line=dict(color="#1240e0", width=2.5))
+    f1.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Wert in €", separators=",.",
+                     legend=dict(orientation="h", y=1.1), hovermode="x unified")
+    st.plotly_chart(f1, width="stretch")
+    st.caption(f"Aus {eur(V)} wären mit deinem jetzigen Portfolio {eur(vc[-1])} geworden, mit dem Vorschlag {eur(vt[-1])}.")
+    st.subheader("Wie tief ging es zwischendurch runter?",
+                 help="Abstand zum bisherigen Höchststand. 0 % = gerade auf Rekordhoch, −20 % = 20 % unter dem "
+                      "letzten Hoch. Je tiefer und länger die Täler, desto härter war es, durchzuhalten.")
+    f2 = go.Figure()
+    for v, n, c in [(vc, "Jetziges Portfolio", "#e8361b"), (vt, "Vorschlag", "#1240e0")]:
+        f2.add_scatter(x=dates, y=v / np.maximum.accumulate(v) - 1, name=n, line=dict(color=c), fill="tozeroy",
+                       opacity=0.5)
+    f2.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), yaxis_tickformat=".0%",
+                     legend=dict(orientation="h", y=1.15), hovermode="x unified")
+    st.plotly_chart(f2, width="stretch")
+    dd = vc / np.maximum.accumulate(vc) - 1
+    under = int((dd < -0.1).sum())
+    st.caption(f"Dein jetziges Portfolio lag in {under} von {T} Monaten mehr als 10 % unter seinem Höchststand.")
+
+with tg[1]:
+    st.subheader("Deine Wertpapiere im Überblick",
+                 help="Kennzahlen jedes einzelnen Wertpapiers über den ausgewerteten Zeitraum. So siehst du, welche "
+                      "Werte dein Portfolio antreiben und welche es bremsen.")
+    yr = (1 + R).groupby(R.index.year).prod() - 1
+    rows = []
+    for i, t in enumerate(assets):
+        m = metrics(R[t].values, rf)
+        rows.append({"Wertpapier": names[i], "Dein Anteil": pc(cur[i], 0), "Ø Gewinn/Jahr": pc(m["Rendite p.a."]),
+                     "Schwankung": pc(m["Vol. p.a."]), "Einschätzung": lvl_vol(m["Vol. p.a."]),
+                     "Schlimmster Absturz": "−" + pc(m["Max. Drawdown"], 0),
+                     "Bestes Jahr": pc(yr[t].max(), 0), "Schlechtestes Jahr": pc(yr[t].min(), 0),
+                     "Gewinn pro Risiko": de(m["Sharpe"], 2)})
+    H = st.column_config.TextColumn
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
+        "Dein Anteil": H(help="Wie viel Prozent deines Geldes heute in diesem Wertpapier stecken."),
+        "Ø Gewinn/Jahr": H(help="Durchschnittliches Wachstum pro Jahr im ausgewerteten Zeitraum."),
+        "Schwankung": H(help="Wie stark der Kurs hoch und runter ging (Volatilität). Mehr = unruhiger."),
+        "Einschätzung": H(help="Grobe Einordnung der Schwankung: unter 8 % sehr ruhig, bis 14 % eher ruhig, "
+                               "bis 22 % mittel, darüber stark schwankend."),
+        "Schlimmster Absturz": H(help="Größter Verlust vom Hoch bis zum Tief. −50 % heißt: zwischenzeitlich halbiert."),
+        "Bestes Jahr": H(help="Kalenderjahr mit dem höchsten Gewinn. Erstes und letztes Jahr sind evtl. unvollständig."),
+        "Schlechtestes Jahr": H(help="Kalenderjahr mit dem größten Verlust."),
+        "Gewinn pro Risiko": H(help="Sharpe Ratio: Gewinn im Verhältnis zur Schwankung. Über 1 ist sehr gut, "
+                                    "unter 0,3 schwach."),
+    })
+    shp = [metrics(R[t].values, rf)["Sharpe"] for t in assets]
+    st.caption(f"Bestes Verhältnis von Gewinn zu Risiko: **{names[int(np.argmax(shp))]}**. "
+               f"Schwächstes: **{names[int(np.argmin(shp))]}**.")
+
+with tg[2]:
+    st.subheader("Gewinn oder Verlust in jedem Kalenderjahr",
+                 help="Wie das Portfolio in jedem einzelnen Jahr abgeschnitten hat. Erstes und letztes Jahr können "
+                      "unvollständig sein. So siehst du, wie oft es Verlustjahre gab und wie schlimm sie waren.")
+    yc = pd.Series(rp_c, index=R.index).add(1).groupby(R.index.year).prod() - 1
+    yt = pd.Series(rp_t, index=R.index).add(1).groupby(R.index.year).prod() - 1
+    f3 = go.Figure()
+    f3.add_bar(x=yc.index.astype(str), y=yc.values, name="Jetziges Portfolio", marker_color="#e8361b")
+    f3.add_bar(x=yt.index.astype(str), y=yt.values, name="Vorschlag", marker_color="#1240e0")
+    f3.update_layout(barmode="group", height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_tickformat=".0%",
+                     legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(f3, width="stretch")
+    st.caption(f"Mit deinem jetzigen Portfolio gab es in {int((yc > 0).sum())} von {len(yc)} Jahren Gewinn. "
+               f"Schlechtestes Jahr: {yc.idxmin()} mit {pc(yc.min())}.")
+
+with tg[3]:
+    st.subheader("Anteil am Geld oder Anteil am Risiko?",
+                 help="Ein Wertpapier kann 20 % deines Geldes ausmachen, aber 40 % deines Risikos verursachen – wenn "
+                      "es stark schwankt und mit den anderen zusammen fällt. Diese Grafik zeigt, woher die Schwankung "
+                      "deines Portfolios wirklich kommt (Risikobeitrag).")
+    rc = cur * (S @ cur) / (cur @ S @ cur)
+    f4 = go.Figure()
+    f4.add_bar(y=names, x=cur, orientation="h", name="Anteil am Geld", marker_color="#b8c4e8")
+    f4.add_bar(y=names, x=rc, orientation="h", name="Anteil am Risiko", marker_color="#e8361b")
+    f4.update_layout(barmode="group", height=60 + 55 * len(assets), margin=dict(l=10, r=10, t=10, b=10),
+                     xaxis_tickformat=".0%", legend=dict(orientation="h", y=1.08), yaxis_autorange="reversed")
+    st.plotly_chart(f4, width="stretch")
+    j = int(np.argmax(rc - cur))
+    st.caption(f"**{names[j]}** macht {pc(cur[j], 0)} deines Geldes aus, verursacht aber {pc(rc[j], 0)} des Risikos."
+               if rc[j] - cur[j] > 0.05 else "Geld und Risiko sind bei dir ungefähr gleich verteilt – das ist gut.")
+
+with tg[4]:
+    st.subheader("Wie hängen deine Wertpapiere zusammen?",
+                 help="Korrelation von −1 bis +1. +1: bewegen sich immer gleich (keine Absicherung). 0: unabhängig. "
+                      "Negativ: bewegen sich gegenläufig (gute Absicherung). Für Streuung sind niedrige Werte gut.")
+    Cm = R.corr().values
+    f5 = go.Figure(go.Heatmap(z=Cm, x=names, y=names, zmin=-1, zmax=1, colorscale="RdBu_r",
+                              text=[[de(v, 2) for v in row] for row in Cm], texttemplate="%{text}",
+                              colorbar=dict(title="Korrelation")))
+    f5.update_layout(height=120 + 60 * len(assets), margin=dict(l=10, r=10, t=10, b=10), yaxis_autorange="reversed")
+    st.plotly_chart(f5, width="stretch")
+    iu = np.triu_indices(len(assets), 1)
+    k_hi, k_lo = int(np.argmax(Cm[iu])), int(np.argmin(Cm[iu]))
+    st.caption(f"Am ähnlichsten: **{names[iu[0][k_hi]]}** und **{names[iu[1][k_hi]]}** ({de(Cm[iu][k_hi], 2)}). "
+               f"Am unterschiedlichsten: **{names[iu[0][k_lo]]}** und **{names[iu[1][k_lo]]}** ({de(Cm[iu][k_lo], 2)}) – "
+               "dieses Paar sichert sich am besten gegenseitig ab.")
+
 st.subheader(f"Was könnte in {hor} Jahren aus {eur(V)} werden?",
              help="Simulation: Aus den echten Monaten der Vergangenheit werden 2000 mögliche Zukünfte "
                   "zusammengewürfelt. Die Spanne zeigt, wo 9 von 10 Fällen landen. Keine Vorhersage: "
@@ -508,6 +622,21 @@ c1.markdown(f"**Jetziges Portfolio**  \nwahrscheinlich etwa **{eur(a['Median'])}
 c2.markdown(f"**Mit dem Vorschlag**  \nwahrscheinlich etwa **{eur(b['Median'])}**  \n"
             f"in 9 von 10 Fällen zwischen {eur(b['5 %'])} und {eur(b['95 %'])}  \n"
             f"Risiko, am Ende weniger als eingesetzt zu haben: {pc(b['P(Verlust)'], 0)}")
+paths = {k: V * np.cumprod(1 + (R.values @ W[k])[idx], axis=1) for k in ("Aktuell", target)}
+xm = np.arange(1, hor * 12 + 1) / 12
+f6 = go.Figure()
+for k, col, rgba, nm in [("Aktuell", "#e8361b", "rgba(232,54,27,0.15)", "Jetziges Portfolio"),
+                         (target, "#1240e0", "rgba(18,64,224,0.15)", "Vorschlag")]:
+    p5, p50, p95 = np.percentile(paths[k], [5, 50, 95], axis=0)
+    f6.add_scatter(x=np.r_[xm, xm[::-1]], y=np.r_[p95, p5[::-1]], fill="toself", fillcolor=rgba,
+                   line=dict(width=0), name=nm + " (9 von 10 Fällen)", hoverinfo="skip")
+    f6.add_scatter(x=xm, y=p50, name=nm + " (mittlerer Fall)", line=dict(color=col, width=2.5))
+f6.add_hline(y=V, line_dash="dot", line_color="gray", annotation_text="Startwert")
+f6.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Jahre ab heute",
+                 yaxis_title="Wert in €", separators=",.", legend=dict(orientation="h", y=-0.2))
+st.plotly_chart(f6, width="stretch")
+st.caption("Die Linie zeigt den mittleren Fall, die Fläche den Bereich, in dem 9 von 10 simulierten Zukünften landen. "
+           "Mit ? an der Überschrift: mehr zur Methode.")
 cagr = (b["Median"] / V) ** (1 / hor) - 1
 wa, wb = a["95 %"] - a["5 %"], b["95 %"] - b["5 %"]
 explain([
