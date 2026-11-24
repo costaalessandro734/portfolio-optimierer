@@ -16,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 from scipy.optimize import minimize
 
-st.set_page_config(page_title="Portfolio-Check", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Portfolio-Check", layout="wide", initial_sidebar_state="auto")
 
 # =====================================================================
 # Design: Royalblau (Hauptfarbe) + Türkis (Nebenfarbe)
@@ -94,6 +94,69 @@ button[data-baseweb="tab"] p { font-size: 1.05rem; font-weight: 600; }
 
 /* Hinweis-, Erfolgs- und Warnboxen weicher */
 [data-testid="stAlert"] { border-radius: 14px; }
+</style>
+""", unsafe_allow_html=True)
+
+# =====================================================================
+# Handy-Ansicht
+# =====================================================================
+def _is_phone():
+    try:
+        ua = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        ua = ""
+    return bool(re.search(r"iPhone|iPod|Android.*Mobile|Mobile Safari|Windows Phone", ua))
+
+
+st.session_state.setdefault("mobile", _is_phone())
+st.session_state["mobile"] = st.session_state["mobile"]
+MOBILE = bool(st.session_state["mobile"])
+
+from streamlit.delta_generator import DeltaGenerator as _DG
+if not hasattr(_DG, "_orig_plotly_chart"):
+    _DG._orig_plotly_chart = _DG.plotly_chart
+
+    def _plotly_chart(self, fig, *a, **k):
+        if st.session_state.get("mobile"):
+            try:
+                h_ = fig.layout.height or 450
+                fig.update_layout(height=int(h_ * 0.8 if h_ > 600 else min(max(h_ * 0.7, 280), 420)), margin=dict(l=4, r=4, t=28, b=4),
+                                  font=dict(size=11), dragmode=False,
+                                  legend=dict(orientation="h", yanchor="top", y=-0.15, x=0, font=dict(size=11)))
+                fig.update_xaxes(fixedrange=True, title_font=dict(size=11))
+                fig.update_yaxes(fixedrange=True, title_font=dict(size=11))
+            except Exception:
+                pass
+            k["config"] = {**(k.get("config") or {}), "displayModeBar": False, "scrollZoom": False}
+        return _DG._orig_plotly_chart(self, fig, *a, **k)
+    _DG.plotly_chart = _plotly_chart
+st.plotly_chart = lambda *a, **k: _DG.plotly_chart(st._main, *a, **k)
+
+# Kleine Bildschirme: greift immer, egal ob Handy-Ansicht an ist
+st.markdown("""
+<style>
+@media (max-width: 720px) {
+  html { font-size: 15.5px; }
+  .block-container { padding: .8rem .7rem 3rem !important; }
+  .hero { border-radius: 16px; padding: 1rem 1.05rem .95rem; margin-bottom: .8rem; }
+  .hero::after { display: none; }
+  .hero h1 { font-size: 1.5rem !important; }
+  .hero p { font-size: .95rem; }
+  h2 { font-size: 1.3rem !important; } h3 { font-size: 1.1rem !important; }
+  [data-testid="stSidebar"] { min-width: 0 !important; }
+  /* Kennzahlen zu zweit nebeneinander statt alle untereinander */
+  [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) { flex-wrap: wrap !important; gap: .5rem !important; }
+  [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > [data-testid="stColumn"] {
+    min-width: calc(50% - .25rem) !important; max-width: calc(50% - .25rem) !important; flex: 1 1 calc(50% - .25rem) !important; }
+  [data-testid="stMetric"] { padding: .55rem .65rem; border-radius: 12px; }
+  [data-testid="stMetricValue"] { font-size: 1.25rem; }
+  [data-testid="stMetricLabel"] p { font-size: .8rem; }
+  [data-testid="stMetricDelta"] { font-size: .8rem; }
+  [class*="st-key-explain"] { padding: .75rem .85rem .2rem; border-left-width: 4px; }
+  .stTabs [data-baseweb="tab-list"] { overflow-x: auto; flex-wrap: nowrap; }
+  button[data-baseweb="tab"] p { font-size: .92rem; }
+  .stButton > button, .stDownloadButton > button { width: 100%; min-height: 2.8rem; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -805,6 +868,9 @@ if "load_msg" in ss:
 expert = sb.toggle("Expertenmodus", key="expert",
                    help="Schaltet zusätzliche Seiten (Efficient Frontier, Style Analysis, Strategievergleich) und "
                         "Einstellungen frei, z. B. eigene Grenzen pro Wertpapier und einen Benchmark.")
+sb.toggle("📱 Handy-Ansicht", key="mobile",
+          help="Kleinere, ruhige Grafiken (kein versehentliches Zoomen beim Scrollen), Kennzahlen zu zweit "
+               "nebeneinander, große Knöpfe. Wird auf dem Handy automatisch eingeschaltet.")
 goal_opts = list(GOALS)[:3] + (list(GOALS)[3:] if expert else [])
 if ss.get("goal") not in goal_opts:
     ss.goal = goal_opts[1]
