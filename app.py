@@ -1,9 +1,9 @@
-"""Portfolio-Optimierer – Streamlit-Version mit automatischem Kursdownload.
+"""Portfolio-Check – einsteigerfreundlicher Portfolio-Optimierer (Streamlit).
 
 Start lokal:  streamlit run app.py
 """
 import io
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -12,61 +12,71 @@ import streamlit as st
 import yfinance as yf
 from scipy.optimize import minimize
 
-st.set_page_config(page_title="Portfolio-Optimierer", layout="wide")
+st.set_page_config(page_title="Portfolio-Check", layout="wide")
 
 # =====================================================================
-# Info-Texte (erscheinen beim ?-Symbol neben jedem Element)
+# Deutsche Zahlenformate
 # =====================================================================
-INFO = {
-    "ticker": "Ticker wie bei Yahoo Finance, getrennt durch Komma, z. B. AAPL, SAP.DE, 6033.KL. "
-              "Die Kurse werden automatisch geladen (Yahoo, ersatzweise stooq) und 24 h zwischengespeichert.",
-    "bench": "Vergleichsindex, z. B. ^GSPC (S&P 500), ^GDAXI (DAX), ^KLSE. Wird nicht gekauft, sondern nur "
-             "für Style Analysis und Vergleich genutzt. Leer lassen, wenn du keinen brauchst.",
-    "zeitraum": "Zeitraum der historischen Daten. Mehr Jahre = stabilere Schätzungen, aber ältere Daten "
-                "sagen weniger über heute aus. Gerechnet wird mit Monatsrenditen (letzter Kurs je Monat).",
-    "rf": "Jährliche Rendite einer sicheren Anlage (Staatsanleihe, Tagesgeld). Wird in der Sharpe Ratio "
-          "abgezogen und verschiebt damit, welches Portfolio Max-Sharpe ist.",
-    "pv": "Dein Vermögen in diesem Portfolio. Damit werden Umschichtung und Simulation in Euro umgerechnet.",
-    "mc": "So viele Portfolios mit zufälligen Gewichten (innerhalb deiner Grenzen) werden erzeugt. "
-          "Als Punktwolke zeigen sie, welche Kombinationen aus Rendite und Risiko möglich sind.",
-    "split": "Auf dem ersten Teil der Daten werden die Gewichte geschätzt, auf dem Rest getestet, ohne dass die "
-             "Optimierung diese Monate kannte. Zeigt, ob die Strategie ohne Blick in die Zukunft funktioniert hätte.",
-    "win": "Länge des rollierenden Fensters der Style Analysis. Kürzer reagiert schneller, ist aber unruhiger.",
-    "hor": "Wie viele Jahre in die Zukunft simuliert wird (Bootstrap aus historischen Monatsrenditen).",
-    "upload": "Notlösung, falls ein Ticker nicht geladen werden kann: CSV oder als HTML gespeicherte Tabelle mit "
-              "Datum und Kurs. Der Dateiname wird zum Namen; beginnt er mit ^, wird die Datei zum Benchmark.",
-    "portfolio": "Aktuell %: dein heutiger Anteil (wird automatisch auf 100 % normiert). Min/Max %: Grenzen "
-                 "für das Gewicht in allen Optimierungen. Summe aller Min ≤ 100 % ≤ Summe aller Max. "
-                 "Leerverkäufe sind nicht vorgesehen.",
-    "ziel": "Max-Sharpe: höchste Überrendite pro Risikoeinheit, reagiert stark auf Schätzfehler. Min-Varianz: "
-            "geringste Schwankung, ignoriert erwartete Renditen und ist dadurch robuster. Gleichgewichtet: jedes "
-            "Asset 1/n, ganz ohne Schätzung. Benchmark-Stil: Mischung, die den Benchmark am besten nachbildet.",
-    "ret": "Durchschnittliche Monatsrendite × 12, historisch. Keine Prognose.",
-    "vol": "Standardabweichung der Monatsrenditen × √12. Misst die Schwankung.",
-    "sh": "(Rendite − risikofreier Zins) ÷ Volatilität: Überrendite pro Einheit Risiko. Höher ist besser.",
-    "mdd": "Größter Verlust von einem Höchststand bis zum folgenden Tiefpunkt im Zeitraum.",
-    "rebal": "Unterschied zwischen aktuellen und Zielgewichten. pp = Prozentpunkte, Betrag = Änderung × "
-             "Portfoliowert. Unter 0,5 pp: halten. Transaktionskosten und Steuern sind nicht berücksichtigt.",
-    "front": "Jeder Punkt ist ein Zufallsportfolio (rechts = mehr Risiko, oben = mehr Rendite). Die Linie ist die "
-             "Efficient Frontier: für jedes Risiko die höchste erreichbare Rendite unter deinen Grenzen. Liegt dein "
-             "Portfolio deutlich darunter, wäre bei gleichem Risiko mehr Rendite möglich gewesen.",
-    "style": "Returns-based Style Analysis nach Sharpe: Benchmark-Renditen werden auf die Asset-Renditen regressiert, "
-             "Gewichte summieren zu 100 % und liegen in deinen Grenzen. R² zeigt, wie viel der Index-Schwankung die "
-             "Mischung erklärt (1 = perfekt).",
-    "risk": "Kennzahlen über den ganzen Zeitraum. VaR 95 %: Monatsverlust, der in 95 % der Monate nicht überschritten "
-            "wurde. CVaR 95 %: durchschnittlicher Verlust in den schlechtesten 5 % der Monate. Achtung: Die optimierten "
-            "Gewichte wurden auf denselben Daten geschätzt, sehen hier also zu gut aus.",
-    "bt": "Gewichte nur mit den Trainingsmonaten berechnet, dann auf den Testzeitraum angewendet (monatlich "
-          "rebalanciert). Start = 100. Der ehrlichste Test, ob eine Strategie wirklich besser ist.",
-    "boot": "2000 Zukunftspfade: Jeder Monat ist ein zufällig gezogener historischer Monat (alle Assets gemeinsam, "
-            "Korrelationen bleiben). 5 % = schlechtes, Median = mittleres, 95 % = sehr gutes Szenario. "
-            "P(Verlust) = Anteil der Pfade unter dem Startwert. Annahme: Die Zukunft ähnelt der Vergangenheit.",
+def de(x, d=1):
+    return f"{x:,.{d}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def sg(x, d=1):
+    return ("+" if x > 0 else "") + de(x, d)
+
+
+def eur(x):
+    return de(x, 0) + " €"
+
+
+def pc(x, d=1):
+    return de(x * 100, d) + " %"
+
+
+# =====================================================================
+# Bekannte Wertpapiere (Name -> Yahoo-Ticker)
+# =====================================================================
+POPULAR = {
+    "Apple": "AAPL", "Microsoft": "MSFT", "Nvidia": "NVDA", "Amazon": "AMZN", "Alphabet (Google)": "GOOGL",
+    "Meta (Facebook)": "META", "Tesla": "TSLA", "Coca-Cola": "KO", "Johnson & Johnson": "JNJ",
+    "SAP": "SAP.DE", "Siemens": "SIE.DE", "Allianz": "ALV.DE", "Deutsche Telekom": "DTE.DE",
+    "Mercedes-Benz": "MBG.DE", "iShares MSCI World ETF": "EUNL.DE", "iShares S&P 500 ETF": "SXR8.DE",
+    "Gold (ETF)": "GLD",
 }
+NAME = {v: k for k, v in POPULAR.items()}
+label = lambda t: NAME.get(t, t)
+
+GOALS = {
+    "Möglichst ruhig (wenig Schwankung)": "Min-Varianz",
+    "Bestes Verhältnis von Gewinn zu Risiko": "Max-Sharpe",
+    "Einfach gleichmäßig verteilen": "Gleichgewichtet",
+}
+
+GLOSSAR = """
+**Rendite / Gewinn pro Jahr** – wie viel das Portfolio im Durchschnitt pro Jahr gewachsen ist.
+
+**Schwankung (Volatilität)** – wie stark der Wert hoch und runter geht. 15 % heißt grob: In einem normalen Jahr kann
+es leicht 15 % besser oder schlechter laufen als im Durchschnitt.
+
+**Schlimmster Absturz (Max. Drawdown)** – der größte Verlust vom Höchststand bis zum Tiefpunkt. 30 % heißt: Aus
+10.000 € wurden zwischenzeitlich 7.000 €.
+
+**Sharpe Ratio** – Gewinn pro Einheit Risiko. Je höher, desto besser „bezahlt“ wird das Risiko.
+
+**Backtest** – Wir tun so, als stünden wir in der Vergangenheit: Die Vorschläge werden nur mit älteren Daten
+berechnet und dann mit den neueren Daten geprüft. So sieht man, ob sie wirklich geholfen hätten.
+
+**Simulation** – Aus den echten Monaten der Vergangenheit werden tausende mögliche Zukünfte zusammengewürfelt.
+Das zeigt eine Spanne, keine Vorhersage.
+
+**Ticker** – das Kürzel eines Wertpapiers bei Yahoo Finance, z. B. AAPL für Apple oder SAP.DE für SAP an der
+Börse Xetra.
+"""
 
 # =====================================================================
 # Daten laden
 # =====================================================================
-def to_monthly(s: pd.Series) -> pd.Series:
+def to_monthly(s):
     s = pd.to_numeric(s, errors="coerce").dropna()
     s.index = pd.to_datetime(s.index)
     if s.index.tz is not None:
@@ -107,14 +117,13 @@ def load(ticker, start, end):
     return None, None
 
 
-def parse_upload(file) -> pd.Series:
+def parse_upload(file):
     raw = file.getvalue()
     if file.name.lower().endswith((".html", ".htm")):
         df = max(pd.read_html(io.BytesIO(raw)), key=len)
     else:
         df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
-    cols = [" ".join(map(str, c)) if isinstance(c, tuple) else str(c) for c in df.columns]
-    cols = [c.lower() for c in cols]
+    cols = [(" ".join(map(str, c)) if isinstance(c, tuple) else str(c)).lower() for c in df.columns]
     di = next((i for i, c in enumerate(cols) if "date" in c or "datum" in c or c == "index"), 0)
     pi = next((i for i, c in enumerate(cols) if c.startswith("adj") or c.endswith("adjusted")), None)
     if pi is None:
@@ -122,13 +131,12 @@ def parse_upload(file) -> pd.Series:
     d = df.iloc[:, di].astype(str)
     dates = pd.to_datetime(d, errors="coerce", dayfirst=d.str.contains(r"^\d{1,2}\.\d{1,2}\.\d{4}").any(), format="mixed")
     p = df.iloc[:, pi].astype(str).str.strip()
-    if p.str.match(r"^-?\d{1,3}(\.\d{3})*,\d+$").any():      # deutsches Format 1.234,56
+    if p.str.match(r"^-?\d{1,3}(\.\d{3})*,\d+$").any():
         p = p.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     else:
         p = p.str.replace(",", "", regex=False)
     s = pd.Series(pd.to_numeric(p, errors="coerce").values, index=dates)
-    s = s[s.index.notna()]
-    return to_monthly(s)
+    return to_monthly(s[s.index.notna()])
 
 
 # =====================================================================
@@ -164,12 +172,10 @@ def frontier(mu, S, lo, hi, k=40):
 
 def style_fit(X, y, lo, hi):
     w = solve(lambda w: 1e4 * np.sum((y - X @ w) ** 2), X.shape[1], lo, hi)
-    r2 = 1 - np.sum((y - X @ w) ** 2) / np.sum((y - y.mean()) ** 2)
-    return w, r2
+    return w, 1 - np.sum((y - X @ w) ** 2) / np.sum((y - y.mean()) ** 2)
 
 
 def proj(v, lo, hi):
-    """Projektion auf {Summe = 1, lo ≤ w ≤ hi} (für Zufallsportfolios)."""
     a, b = (v - hi).min(), (v - lo).max()
     for _ in range(50):
         t = (a + b) / 2
@@ -205,201 +211,324 @@ def optimise_all(R, lo, hi, rf, cur, y=None):
 # Sidebar
 # =====================================================================
 sb = st.sidebar
-sb.header("Eingaben")
-tick_txt = sb.text_input("Ticker", "AAPL, MSFT, JNJ, XOM, KO", help=INFO["ticker"])
-bench_t = sb.text_input("Benchmark (optional)", "^GSPC", help=INFO["bench"]).strip()
-c1, c2 = sb.columns(2)
-start = c1.date_input("Von", date(2013, 1, 1), help=INFO["zeitraum"])
-end = c2.date_input("Bis", date.today())
-rf = sb.number_input("Risikofreier Zins p.a. %", value=2.0, step=0.1, help=INFO["rf"]) / 100
-V = sb.number_input("Portfoliowert €", value=10000.0, step=500.0, min_value=0.0, help=INFO["pv"])
-n_mc = sb.select_slider("Zufallsportfolios", [1000, 3000, 6000], 3000, help=INFO["mc"])
-split = sb.slider("Backtest: Trainingsanteil %", 30, 90, 70, 5, help=INFO["split"])
-win = int(sb.number_input("Style-Fenster (Monate)", 12, 120, 36, help=INFO["win"]))
-hor = int(sb.number_input("Simulationshorizont (Jahre)", 1, 30, 5, help=INFO["hor"]))
-uploads = sb.file_uploader("Notlösung: CSV/HTML hochladen", accept_multiple_files=True, help=INFO["upload"])
-
-st.title("Portfolio-Optimierer")
-st.caption("Kurse werden automatisch geladen. Trage deine Gewichte ein: Die App simuliert, optimiert unter "
-           "deinen Grenzen und zeigt, was du umschichten müsstest. Keine Anlageberatung.")
+expert = sb.toggle("Expertenmodus", False,
+                   help="Zeigt alle Einstellungen und Analysen: Efficient Frontier, Style Analysis, "
+                        "Risikokennzahlen, eigene Grenzen pro Wertpapier.")
+years = sb.slider("Wie viele Jahre zurückschauen?", 3, 25, 10,
+                  help="So viele Jahre Kursgeschichte werden ausgewertet. Mehr Jahre = mehr Erfahrung, "
+                       "aber sehr alte Daten sagen weniger über heute aus.")
+hor = sb.slider("Für wie viele Jahre willst du anlegen?", 1, 30, 5,
+                help="Für diesen Zeitraum wird simuliert, was aus deinem Geld werden könnte.")
+start, end = date.today() - timedelta(days=365 * years), date.today()
+rf, n_mc, split, win, bench_t, uploads = 0.02, 3000, 70, 36, "", None
+if expert:
+    sb.divider()
+    sb.subheader("Experten-Einstellungen")
+    if sb.checkbox("Eigenen Zeitraum wählen"):
+        c1, c2 = sb.columns(2)
+        start, end = c1.date_input("Von", start), c2.date_input("Bis", end)
+    bench_t = sb.text_input("Benchmark-Ticker", "", placeholder="z. B. ^GSPC, ^GDAXI, ^KLSE",
+                            help="Vergleichsindex für Style Analysis und Backtest.").strip()
+    rf = sb.number_input("Risikofreier Zins p.a. %", value=2.0, step=0.1,
+                         help="Rendite einer sicheren Anlage, wird in der Sharpe Ratio abgezogen.") / 100
+    n_mc = sb.select_slider("Zufallsportfolios", [1000, 3000, 6000], 3000)
+    split = sb.slider("Backtest: Trainingsanteil %", 30, 90, 70, 5,
+                      help="Auf diesem Anteil wird optimiert, auf dem Rest getestet.")
+    win = int(sb.number_input("Style-Fenster (Monate)", 12, 120, 36))
+    uploads = sb.file_uploader("Kursdateien hochladen (CSV/HTML)", accept_multiple_files=True,
+                               help="Notlösung, falls ein Ticker nicht geladen werden kann. Dateiname = Name; "
+                                    "beginnt er mit ^, wird die Datei zum Benchmark.")
 
 # =====================================================================
-# Kurse holen
+# Kopf
 # =====================================================================
-tickers = list(dict.fromkeys(t.strip().upper() for t in tick_txt.replace(";", ",").split(",") if t.strip()))
-series, sources, failed = {}, {}, []
+st.title("Portfolio-Check")
+st.write("Trag ein, welche Aktien oder ETFs du hast und wie viel Geld jeweils darin steckt. Die App prüft "
+         "mit echten Kursen der letzten Jahre, wie dein Portfolio gelaufen ist, und schlägt vor, wie du es "
+         "besser aufteilen könntest.")
+with st.expander("Begriffe einfach erklärt"):
+    st.markdown(GLOSSAR)
+
+# ---------- Schritt 1 ----------
+st.header("1. Welche Wertpapiere hast du?")
+c1, c2 = st.columns([3, 2])
+picked = c1.multiselect("Aus der Liste wählen", list(POPULAR),
+                        default=["Apple", "Microsoft", "iShares MSCI World ETF", "Allianz", "Coca-Cola"],
+                        help="Bekannte Aktien und ETFs. Fehlt deine? Trag sie rechts als Ticker ein.")
+extra = c2.text_input("Weitere (Ticker, mit Komma getrennt)", "", placeholder="z. B. NOVO-B.CO, BAS.DE",
+                      help="Den Ticker findest du auf finance.yahoo.com: Namen ins Suchfeld eingeben, das Kürzel "
+                           "steht neben dem Namen. Deutsche Börse Xetra endet auf .DE.")
+tickers = [POPULAR[p] for p in picked] + [t.strip().upper() for t in extra.replace(";", ",").split(",") if t.strip()]
+tickers = list(dict.fromkeys(tickers))
+
+series, failed = {}, []
 with st.spinner("Lade Kurse …"):
     for t in tickers + ([bench_t] if bench_t else []):
-        s, src = load(t, start, end)
+        s, _ = load(t, start, end)
         if s is None:
             failed.append(t)
         else:
-            series[t], sources[t] = s, src
+            series[t] = s
 bench = bench_t if bench_t in series else None
-
 for f in uploads or []:
     name = f.name.rsplit(".", 1)[0]
     try:
-        series[name], sources[name] = parse_upload(f), "Upload"
+        series[name] = parse_upload(f)
         if name.startswith("^") and bench is None:
             bench = name
         elif name not in tickers:
             tickers.append(name)
-        if name in failed:
-            failed.remove(name)
+        failed = [x for x in failed if x != name]
     except Exception as e:
         st.warning(f"{f.name} konnte nicht gelesen werden: {e}")
 
 if failed:
-    st.warning("Keine Kurse gefunden für: " + ", ".join(failed) +
-               ". Ticker prüfen (Yahoo-Schreibweise) oder als Datei in der Sidebar hochladen.")
+    st.warning("Für **" + ", ".join(failed) + "** wurden keine Kurse gefunden. Prüfe die Schreibweise des Tickers "
+               "auf finance.yahoo.com. Die übrigen Wertpapiere werden trotzdem ausgewertet.")
 assets = [t for t in tickers if t in series and t != bench]
 if len(assets) < 2:
-    st.info("Mindestens 2 Assets mit Kursdaten nötig.")
+    st.info("Wähle mindestens **2 Wertpapiere** aus, damit verglichen und optimiert werden kann.")
     st.stop()
 
 prices = pd.concat({t: series[t] for t in assets + ([bench] if bench else [])}, axis=1).dropna()
 R_all = prices.pct_change().dropna()
-R = R_all[assets]
-y = R_all[bench].values if bench else None
-T = len(R)
+R, y, T = R_all[assets], (R_all[bench].values if bench else None), len(R_all)
 if T < 25:
-    st.error(f"Nur {T} gemeinsame Monate. Für Optimierung und Backtest braucht es mindestens 25.")
+    st.error(f"Für diese Auswahl gibt es nur {T} gemeinsame Monate Kursgeschichte. Es braucht mindestens 25. "
+             "Wähle mehr Jahre oder entferne sehr junge Wertpapiere.")
     st.stop()
-st.caption(f"{T} Monatsrenditen von {R.index[0]} bis {R.index[-1]} · Quellen: " +
-           ", ".join(f"{t} ({sources[t]})" for t in assets + ([bench] if bench else [])))
+young = [label(t) for t in assets if len(series[t]) < years * 12 - 3]
+if young and not expert:
+    st.caption("Hinweis: " + ", ".join(young) + " gibt es noch nicht so lange. Ausgewertet werden nur die "
+               f"gemeinsamen {T} Monate.")
 
-# =====================================================================
-# Portfolio-Eingabe
-# =====================================================================
-st.subheader("Dein Portfolio", help=INFO["portfolio"])
-base = pd.DataFrame({"Ticker": assets, "Aktuell %": round(100 / len(assets), 1), "Min %": 0.0, "Max %": 100.0})
-ed = st.data_editor(base, key="w_" + "_".join(assets), hide_index=True, disabled=["Ticker"], width="stretch",
-                    column_config={c: st.column_config.NumberColumn(c, min_value=0.0, max_value=100.0, step=1.0)
-                                   for c in ["Aktuell %", "Min %", "Max %"]})
-lo, hi = ed["Min %"].fillna(0).values / 100, ed["Max %"].fillna(100).values / 100
-cur = ed["Aktuell %"].fillna(0).clip(lower=0).values
-cur = cur / cur.sum() if cur.sum() > 0 else np.full(len(assets), 1 / len(assets))
-if lo.sum() > 1.0001 or hi.sum() < 0.9999 or (lo > hi).any():
-    st.error("Grenzen unzulässig: Summe aller Min ≤ 100 % ≤ Summe aller Max, und Min ≤ Max.")
+# ---------- Schritt 2 ----------
+st.header("2. Wie viel Geld steckt jeweils darin?")
+st.write("Trag den aktuellen Wert in Euro ein. Grobe Werte reichen.")
+dmax = 40.0 if len(assets) >= 3 else 100.0
+base = pd.DataFrame({"Wertpapier": [label(t) for t in assets], "Ticker": assets, "Wert in €": 1000.0})
+cfg = {"Wert in €": st.column_config.NumberColumn("Wert in €", min_value=0.0, step=100.0, format="%.0f €")}
+if expert:
+    base["Min %"], base["Max %"] = 0.0, dmax
+    for c in ("Min %", "Max %"):
+        cfg[c] = st.column_config.NumberColumn(c, min_value=0.0, max_value=100.0, step=1.0,
+                                               help="Grenzen für das Gewicht in allen Optimierungen.")
+ed = st.data_editor(base, key=f"ed_{expert}_" + "_".join(assets), hide_index=True, disabled=["Wertpapier", "Ticker"],
+                    column_config=cfg, width="stretch")
+vals = ed["Wert in €"].fillna(0).clip(lower=0).values
+V = vals.sum()
+if V <= 0:
+    st.info("Trag bei mindestens einem Wertpapier einen Betrag ein.")
     st.stop()
+cur = vals / V
+if expert:
+    lo, hi = ed["Min %"].fillna(0).values / 100, ed["Max %"].fillna(100).values / 100
+    if lo.sum() > 1.0001 or hi.sum() < 0.9999 or (lo > hi).any():
+        st.error("Grenzen unzulässig: Summe aller Min ≤ 100 % ≤ Summe aller Max, und Min ≤ Max.")
+        st.stop()
+else:
+    lo, hi = np.zeros(len(assets)), np.full(len(assets), dmax / 100)
+    if dmax < 100:
+        st.caption(f"Damit nicht alles auf eine Karte gesetzt wird, steckt der Vorschlag höchstens {de(dmax, 0)} % "
+                   "in ein einzelnes Wertpapier.")
+
+# ---------- Schritt 3 ----------
+st.header("3. Was ist dir wichtiger?")
+goal_txt = st.radio("Ziel", list(GOALS) + (["Benchmark nachbilden (Style Analysis)"] if expert and bench else []),
+                    index=1, label_visibility="collapsed",
+                    help="Ruhig: geringste Schwankung, schaut nicht auf Gewinne und ist daher am robustesten. "
+                         "Bestes Verhältnis: maximiert die Sharpe Ratio, reagiert aber stark auf Zufälle in "
+                         "den Vergangenheitsdaten. Gleichmäßig: jedes Wertpapier gleich viel, ganz ohne Rechnung.")
+target = GOALS.get(goal_txt, "Benchmark-Stil")
 
 # =====================================================================
 # Rechnen
 # =====================================================================
 W, mu, S = optimise_all(R, lo, hi, rf, cur, y)
 M = {k: metrics(R.values @ w, rf) for k, w in W.items()}
-
-target = st.selectbox("Ziel-Strategie", [k for k in W if k != "Aktuell"], index=2, help=INFO["ziel"])
 tw, tm, cm = W[target], M[target], M["Aktuell"]
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Rendite p.a.", f"{tm['Rendite p.a.']:.1%}", f"{(tm['Rendite p.a.'] - cm['Rendite p.a.']) * 100:+.1f} pp", help=INFO["ret"])
-k2.metric("Volatilität p.a.", f"{tm['Vol. p.a.']:.1%}", f"{(tm['Vol. p.a.'] - cm['Vol. p.a.']) * 100:+.1f} pp", delta_color="inverse", help=INFO["vol"])
-k3.metric("Sharpe Ratio", f"{tm['Sharpe']:.2f}", f"{tm['Sharpe'] - cm['Sharpe']:+.2f}", help=INFO["sh"])
-k4.metric("Max. Drawdown", f"{tm['Max. Drawdown']:.1%}", f"{(tm['Max. Drawdown'] - cm['Max. Drawdown']) * 100:+.1f} pp", delta_color="inverse", help=INFO["mdd"])
-st.caption("Veränderung gegenüber deinem aktuellen Portfolio, historisch und in-sample.")
+idx = np.random.default_rng(11).integers(0, T, (2000, hor * 12))
+SIM = {}
+for k, w in W.items():
+    v = np.prod(1 + (R.values @ w)[idx], axis=1) * V
+    SIM[k] = {"5 %": np.percentile(v, 5), "Median": np.median(v), "95 %": np.percentile(v, 95), "P(Verlust)": (v < V).mean()}
 
-left, right = st.columns([5, 7])
+s_ = round(T * split / 100)
+BT = None
+if s_ >= 24 and T - s_ >= 6:
+    Wt, _, _ = optimise_all(R.iloc[:s_], lo, hi, rf, cur, None if y is None else y[:s_])
+    test = R.iloc[s_:]
+    BT = {k: metrics(test.values @ w, rf) for k, w in Wt.items()}
+    CURVES = {k: np.cumprod(1 + test.values @ w) * 100 for k, w in Wt.items()}
+    if y is not None:
+        BT["Benchmark"], CURVES["Benchmark"] = metrics(y[s_:], rf), np.cumprod(1 + y[s_:]) * 100
+
+# =====================================================================
+# Ergebnis – einfach
+# =====================================================================
+st.header("Ergebnis")
+d = tw - cur
+moves = [(label(t), d[i] * V) for i, t in enumerate(assets) if abs(d[i]) >= 0.005]
+if not moves:
+    st.success(f"Dein Portfolio ist für das Ziel „{goal_txt}“ schon gut aufgeteilt. Du musst nichts ändern.")
+else:
+    buy = [f"**{n}** (+{eur(x)})" for n, x in moves if x > 0]
+    sell = [f"**{n}** (−{eur(-x)})" for n, x in moves if x < 0]
+    st.info("**Vorschlag:** " + ("Mehr kaufen: " + ", ".join(buy) + ". " if buy else "") +
+            ("Weniger halten: " + ", ".join(sell) + "." if sell else ""))
+
+left, right = st.columns([5, 6])
 with left:
-    st.subheader("Umschichtung", help=INFO["rebal"])
-    d = tw - cur
-    rb = pd.DataFrame({"Ticker": assets, "Aktuell %": cur * 100, "Ziel %": tw * 100, "Änderung pp": d * 100,
-                       "Betrag €": d * V})
-    rb["Aktion"] = np.where(np.abs(d) < 0.005, "halten", np.where(d > 0, "kaufen", "verkaufen"))
-    st.dataframe(rb.style.format({"Aktuell %": "{:.1f}", "Ziel %": "{:.1f}", "Änderung pp": "{:+.1f}",
-                                  "Betrag €": "{:+,.0f}"}), hide_index=True, width="stretch")
-
+    st.subheader("Was du ändern müsstest",
+                 help="Beträge in Euro, bezogen auf dein Gesamtvermögen von " + eur(V) +
+                      ". Kleine Änderungen unter 0,5 % werden als „behalten“ gezeigt. Gebühren und Steuern "
+                      "sind nicht eingerechnet.")
+    act = [("behalten" if abs(x) < 0.005 else (f"+{eur(x * V)} kaufen" if x > 0 else f"−{eur(-x * V)} verkaufen"))
+           for x in d]
+    st.dataframe(pd.DataFrame({"Wertpapier": [label(t) for t in assets], "Jetzt": [eur(c * V) for c in cur],
+                               "Vorschlag": [eur(w * V) for w in tw], "Was tun?": act}),
+                 hide_index=True, width="stretch")
 with right:
-    st.subheader("Efficient Frontier und Monte-Carlo-Portfolios", help=INFO["front"])
+    fig = go.Figure()
+    names = [label(t) for t in assets]
+    fig.add_bar(y=names, x=cur, orientation="h", name="Jetzt", marker_color="#b8c4e8")
+    fig.add_bar(y=names, x=tw, orientation="h", name="Vorschlag", marker_color="#1240e0")
+    fig.update_layout(barmode="group", height=60 + 55 * len(assets), margin=dict(l=10, r=10, t=10, b=10),
+                      xaxis_tickformat=".0%", legend=dict(orientation="h", y=1.08), yaxis_autorange="reversed")
+    st.plotly_chart(fig, width="stretch")
+
+st.subheader(f"Vorher und nachher – so wäre es in den letzten {years} Jahren gelaufen")
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Ø Gewinn pro Jahr", pc(tm["Rendite p.a."]), f"{sg((tm['Rendite p.a.'] - cm['Rendite p.a.']) * 100)} Prozentpunkte",
+          help="Durchschnittliches Wachstum pro Jahr mit dem Vorschlag. Darunter: Unterschied zu deinem jetzigen Portfolio.")
+k2.metric("Schwankung", pc(tm["Vol. p.a."]), f"{sg((tm['Vol. p.a.'] - cm['Vol. p.a.']) * 100)} Prozentpunkte",
+          delta_color="inverse", help="Wie stark der Wert hoch und runter geht. Weniger ist ruhiger.")
+k3.metric("Schlimmster Absturz", "−" + pc(tm["Max. Drawdown"]),
+          f"{sg((tm['Max. Drawdown'] - cm['Max. Drawdown']) * 100)} Prozentpunkte", delta_color="inverse",
+          help="Größter Verlust vom Höchststand bis zum Tiefpunkt. Weniger ist besser.")
+k4.metric("Gewinn pro Risiko", de(tm["Sharpe"], 2), sg(tm["Sharpe"] - cm["Sharpe"], 2),
+          help="Sharpe Ratio: Wie gut das eingegangene Risiko „bezahlt“ wurde. Höher ist besser.")
+st.caption(f"Dein jetziges Portfolio: Ø {pc(cm['Rendite p.a.'])} pro Jahr, Schwankung {pc(cm['Vol. p.a.'])}, "
+           f"schlimmster Absturz −{pc(cm['Max. Drawdown'])}.")
+
+st.subheader(f"Was könnte in {hor} Jahren aus {eur(V)} werden?",
+             help="Simulation: Aus den echten Monaten der Vergangenheit werden 2000 mögliche Zukünfte "
+                  "zusammengewürfelt. Die Spanne zeigt, wo 9 von 10 Fällen landen. Keine Vorhersage: "
+                  "Die Zukunft kann ganz anders laufen.")
+a, b = SIM["Aktuell"], SIM[target]
+c1, c2 = st.columns(2)
+c1.markdown(f"**Jetziges Portfolio**  \nwahrscheinlich etwa **{eur(a['Median'])}**  \n"
+            f"in 9 von 10 Fällen zwischen {eur(a['5 %'])} und {eur(a['95 %'])}  \n"
+            f"Risiko, am Ende weniger als eingesetzt zu haben: {pc(a['P(Verlust)'], 0)}")
+c2.markdown(f"**Mit dem Vorschlag**  \nwahrscheinlich etwa **{eur(b['Median'])}**  \n"
+            f"in 9 von 10 Fällen zwischen {eur(b['5 %'])} und {eur(b['95 %'])}  \n"
+            f"Risiko, am Ende weniger als eingesetzt zu haben: {pc(b['P(Verlust)'], 0)}")
+
+st.subheader("Hätte der Vorschlag wirklich geholfen?",
+             help="Backtest: Der Vorschlag wird nur mit den älteren 70 % der Daten berechnet und dann auf den "
+                  "neueren 30 % geprüft, die er nicht kannte. Das ist der ehrlichste Test.")
+if BT is None or target not in BT:
+    st.caption("Zu wenig Kursgeschichte für diesen Test.")
+else:
+    bt_t, bt_c = BT[target], BT["Aktuell"]
+    per = f"{R.index[s_]} bis {R.index[-1]}"
+    if bt_t["Sharpe"] > bt_c["Sharpe"] + 0.05:
+        st.success(f"**Ja.** Im Testzeitraum ({per}) hätte der Vorschlag ein besseres Verhältnis von Gewinn zu Risiko "
+                   f"gebracht ({de(bt_t['Sharpe'], 2)} statt {de(bt_c['Sharpe'], 2)}), Ø {pc(bt_t['Rendite p.a.'])} "
+                   f"statt {pc(bt_c['Rendite p.a.'])} pro Jahr.")
+    elif bt_t["Sharpe"] >= bt_c["Sharpe"] - 0.05:
+        st.warning(f"**Kaum Unterschied.** Im Testzeitraum ({per}) war der Vorschlag ungefähr gleich gut wie dein "
+                   "jetziges Portfolio. Eine Umschichtung lohnt sich nach Gebühren wahrscheinlich nicht.")
+    else:
+        st.error(f"**Nein.** Im Testzeitraum ({per}) wäre dein jetziges Portfolio besser gewesen "
+                 f"(Gewinn pro Risiko {de(bt_c['Sharpe'], 2)} statt {de(bt_t['Sharpe'], 2)}). Der Vorschlag passt "
+                 "vor allem zur Vergangenheit – sei vorsichtig damit.")
+
+st.caption("Wichtig: Alle Zahlen beruhen auf vergangenen Kursen. Was früher gut lief, muss nicht so weiterlaufen. "
+           "Gebühren und Steuern sind nicht berücksichtigt. Das ist keine Anlageberatung.")
+
+# =====================================================================
+# Expertenbereich
+# =====================================================================
+if not expert:
+    st.caption("Mehr Details (Efficient Frontier, Risikokennzahlen, Style Analysis): **Expertenmodus** in der Seitenleiste einschalten.")
+    st.stop()
+
+st.divider()
+st.header("Für Fortgeschrittene")
+t0, t1, t2, t3, t4 = st.tabs(["Efficient Frontier", "Style Analysis", "Risiko & Gewichte", "Backtest", "Simulation"])
+
+with t0:
+    st.subheader("Efficient Frontier und Monte-Carlo-Portfolios",
+                 help="Punkte = Zufallsportfolios innerhalb deiner Grenzen. Linie = für jedes Risiko die höchste "
+                      "erreichbare Rendite. Liegt dein Portfolio deutlich darunter, war es ineffizient.")
     rng = np.random.default_rng(5)
     Wr = np.array([proj(w, lo, hi) for w in rng.dirichlet(np.ones(len(assets)), n_mc)])
     r_ret, r_vol = Wr @ mu, np.sqrt(np.einsum("ij,jk,ik->i", Wr, S, Wr))
     F = frontier(mu, S, lo, hi)
-    fig = go.Figure()
-    fig.add_scatter(x=r_vol, y=r_ret, mode="markers", name="Zufallsportfolios",
-                    marker=dict(size=4, color=(r_ret - rf) / r_vol, colorscale="Blues", showscale=True,
-                                colorbar=dict(title="Sharpe")), hoverinfo="skip")
-    fig.add_scatter(x=F[:, 0], y=F[:, 1], mode="lines", name="Efficient Frontier", line=dict(color="black", width=3))
-    fig.add_scatter(x=np.sqrt(np.diag(S)), y=mu, mode="markers+text", text=assets, textposition="top center",
-                    name="Einzelwerte", marker=dict(symbol="square-open", size=9, color="gray"))
+    fg = go.Figure()
+    fg.add_scatter(x=r_vol, y=r_ret, mode="markers", name="Zufallsportfolios", hoverinfo="skip",
+                   marker=dict(size=4, color=(r_ret - rf) / r_vol, colorscale="Blues", showscale=True,
+                               colorbar=dict(title="Sharpe")))
+    fg.add_scatter(x=F[:, 0], y=F[:, 1], mode="lines", name="Efficient Frontier", line=dict(color="black", width=3))
+    fg.add_scatter(x=np.sqrt(np.diag(S)), y=mu, mode="markers+text", text=[label(t) for t in assets],
+                   textposition="top center", name="Einzelwerte", marker=dict(symbol="square-open", size=9, color="gray"))
     for k, sym, col in [("Aktuell", "circle", "#e8361b"), ("Min-Varianz", "circle-open", "#1240e0"),
                         ("Max-Sharpe", "diamond", "#1240e0")]:
         w = W[k]
-        fig.add_scatter(x=[np.sqrt(w @ S @ w)], y=[w @ mu], mode="markers", name=k,
-                        marker=dict(symbol=sym, size=14, color=col, line=dict(width=2, color=col)))
-    fig.update_layout(height=460, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Volatilität p.a.",
-                      yaxis_title="Erw. Rendite p.a.", xaxis_tickformat=".0%", yaxis_tickformat=".0%",
-                      legend=dict(orientation="h", y=-0.18))
-    st.plotly_chart(fig, width="stretch")
-
-# =====================================================================
-# Tabs: Style, Risiko, Backtest, Simulation
-# =====================================================================
-t1, t2, t3, t4 = st.tabs(["Style Analysis", "Risiko & Gewichte", "Backtest", "Zukunftssimulation"])
+        fg.add_scatter(x=[np.sqrt(w @ S @ w)], y=[w @ mu], mode="markers", name=k,
+                       marker=dict(symbol=sym, size=14, color=col, line=dict(width=2, color=col)))
+    fg.update_layout(height=480, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Volatilität p.a.",
+                     yaxis_title="Erw. Rendite p.a.", xaxis_tickformat=".0%", yaxis_tickformat=".0%",
+                     legend=dict(orientation="h", y=-0.18))
+    st.plotly_chart(fg, width="stretch")
 
 with t1:
-    st.subheader("Style Analysis (rollierend)", help=INFO["style"])
+    st.subheader("Style Analysis (rollierend)",
+                 help="Returns-based Style Analysis nach Sharpe: Benchmark-Renditen werden auf die Asset-Renditen "
+                      "regressiert (Gewichte summieren zu 100 %, innerhalb deiner Grenzen).")
     if y is None:
-        st.info("Trage in der Sidebar einen Benchmark ein (z. B. ^GSPC), um die Style Analysis zu sehen.")
+        st.info("Trag in der Seitenleiste einen Benchmark-Ticker ein (z. B. ^GSPC).")
     else:
         w_all, r2 = style_fit(R.values, y, lo, hi)
-        st.write(f"Welche Mischung deiner Assets bildet **{bench}** am besten nach? R² gesamt: **{r2:.2f}**")
+        st.write(f"Mischung, die **{bench}** am besten nachbildet. R² gesamt: **{de(r2, 2)}**")
+        last = np.full(len(assets), np.nan)
         if T >= win + 3:
             rows = [style_fit(R.values[t - win:t], y[t - win:t], lo, hi)[0] for t in range(win, T + 1)]
-            roll = pd.DataFrame(rows, columns=assets, index=R.index[win - 1:].astype(str))
-            fs = go.Figure([go.Scatter(x=roll.index, y=roll[a], stackgroup="one", name=a) for a in assets])
+            roll = pd.DataFrame(rows, columns=[label(t) for t in assets], index=R.index[win - 1:].astype(str))
+            fs = go.Figure([go.Scatter(x=roll.index, y=roll[c], stackgroup="one", name=c) for c in roll])
             fs.update_layout(height=360, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=10, b=10))
             st.plotly_chart(fs, width="stretch")
             last = roll.iloc[-1].values
-        else:
-            st.caption("Zu wenige Monate für das rollierende Fenster.")
-            last = np.full(len(assets), np.nan)
-        st.dataframe(pd.DataFrame({"Ticker": assets, "Gesamtzeitraum %": w_all * 100, "Letztes Fenster %": last * 100})
-                     .style.format({"Gesamtzeitraum %": "{:.1f}", "Letztes Fenster %": "{:.1f}"}),
+        st.dataframe(pd.DataFrame({"Wertpapier": [label(t) for t in assets], "Gesamtzeitraum": [pc(x) for x in w_all],
+                                   "Letztes Fenster": [pc(x) if x == x else "–" for x in last]}),
                      hide_index=True, width="stretch")
 
 with t2:
-    st.subheader("Risikokennzahlen", help=INFO["risk"])
+    st.subheader("Risikokennzahlen (in-sample)",
+                 help="VaR 95 %: Monatsverlust, der in 95 % der Monate nicht überschritten wurde. CVaR 95 %: "
+                      "Ø Verlust in den schlechtesten 5 % der Monate.")
     rk = pd.DataFrame(M).T
     if y is not None:
         rk.loc[f"Benchmark {bench}"] = metrics(y, rf)
-    pfmt = {c: "{:.1%}" for c in rk.columns if c != "Sharpe"} | {"Sharpe": "{:.2f}"}
-    st.dataframe(rk.style.format(pfmt), width="stretch")
+    st.dataframe(rk.style.format({c: (lambda x: de(x, 2)) if c == "Sharpe" else pc for c in rk.columns}), width="stretch")
     st.subheader("Gewichte je Strategie")
-    st.dataframe((pd.DataFrame(W, index=assets) * 100).style.format("{:.1f} %"), width="stretch")
+    st.dataframe(pd.DataFrame(W, index=[label(t) for t in assets]).style.format(pc), width="stretch")
 
 with t3:
-    st.subheader("Out-of-Sample-Backtest", help=INFO["bt"])
-    s_ = round(T * split / 100)
-    if s_ < 24 or T - s_ < 6:
-        st.info("Zu wenige Monate für einen Backtest (mindestens 24 Training + 6 Test).")
+    st.subheader("Out-of-Sample-Backtest")
+    if BT is None:
+        st.info("Zu wenige Monate (mindestens 24 Training + 6 Test).")
     else:
-        Wt, _, _ = optimise_all(R.iloc[:s_], lo, hi, rf, cur, None if y is None else y[:s_])
-        test = R.iloc[s_:]
-        st.caption(f"Training {R.index[0]}–{R.index[s_ - 1]} ({s_} Monate), Test {R.index[s_]}–{R.index[-1]} ({T - s_} Monate).")
-        curves = {k: np.cumprod(1 + test.values @ w) * 100 for k, w in Wt.items()}
-        bm = {k: metrics(test.values @ w, rf) for k, w in Wt.items()}
-        if y is not None:
-            curves["Benchmark"] = np.cumprod(1 + y[s_:]) * 100
-            bm["Benchmark"] = metrics(y[s_:], rf)
-        fb = go.Figure([go.Scatter(x=test.index.astype(str), y=v, name=k) for k, v in curves.items()])
-        fb.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Wert (Start = 100)")
+        st.caption(f"Training {R.index[0]}–{R.index[s_ - 1]}, Test {R.index[s_]}–{R.index[-1]}, monatlich rebalanciert, Start = 100.")
+        fb = go.Figure([go.Scatter(x=R.index[s_:].astype(str), y=v, name=k) for k, v in CURVES.items()])
+        fb.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fb, width="stretch")
-        st.dataframe(pd.DataFrame(bm).T[["Rendite p.a.", "Vol. p.a.", "Sharpe", "Max. Drawdown"]]
-                     .style.format({"Rendite p.a.": "{:.1%}", "Vol. p.a.": "{:.1%}", "Sharpe": "{:.2f}",
-                                    "Max. Drawdown": "{:.1%}"}), width="stretch")
+        bt = pd.DataFrame(BT).T[["Rendite p.a.", "Vol. p.a.", "Sharpe", "Max. Drawdown"]]
+        st.dataframe(bt.style.format({c: (lambda x: de(x, 2)) if c == "Sharpe" else pc for c in bt.columns}), width="stretch")
 
 with t4:
-    st.subheader(f"Bootstrap: Endwert nach {hor} Jahren (Start {V:,.0f} €)", help=INFO["boot"])
-    idx = np.random.default_rng(11).integers(0, T, (2000, hor * 12))
-    sim = {}
-    for k, w in W.items():
-        end_v = np.prod(1 + (R.values @ w)[idx], axis=1) * V
-        sim[k] = {"5 %": np.percentile(end_v, 5), "Median": np.median(end_v),
-                  "95 %": np.percentile(end_v, 95), "P(Verlust)": (end_v < V).mean()}
-    st.dataframe(pd.DataFrame(sim).T.style.format({"5 %": "{:,.0f} €", "Median": "{:,.0f} €",
-                                                   "95 %": "{:,.0f} €", "P(Verlust)": "{:.0%}"}), width="stretch")
-
-st.caption("Alle Optimierungen basieren auf Vergangenheitsdaten. Max-Sharpe reagiert stark auf Schätzfehler und "
-           "liefert oft extreme Gewichte; vergleiche immer den Out-of-Sample-Backtest. Keine Anlageberatung.")
+    st.subheader(f"Bootstrap: Endwert nach {hor} Jahren (Start {eur(V)})")
+    sm = pd.DataFrame(SIM).T
+    st.dataframe(sm.style.format({"5 %": eur, "Median": eur, "95 %": eur, "P(Verlust)": lambda x: pc(x, 0)}), width="stretch")
