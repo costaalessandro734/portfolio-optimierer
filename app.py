@@ -4,7 +4,7 @@ Start lokal:  streamlit run app.py
 """
 import io
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import json
 import re
 from datetime import date, timedelta
@@ -239,13 +239,30 @@ def to_monthly(s):
     return s.groupby(s.index.to_period("M")).last()
 
 
-def pmap(fn, items, workers=12):
-    """Mehrere Netzwerk-Abfragen gleichzeitig statt nacheinander."""
+def pmap(fn, items, workers=12, budget=20):
+    """Mehrere Netzwerk-Abfragen gleichzeitig – nach `budget` Sekunden wird nicht mehr gewartet (Ergebnis None)."""
     items = list(items)
     if not items:
         return []
-    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
-        return list(ex.map(fn, items))
+    ex = ThreadPoolExecutor(max_workers=min(workers, len(items)))
+    futs = [ex.submit(fn, it) for it in items]
+    wait(futs, timeout=budget)
+    ex.shutdown(wait=False, cancel_futures=True)
+    out = []
+    for f_ in futs:
+        try:
+            out.append(f_.result() if f_.done() else None)
+        except Exception:
+            out.append(None)
+    return out
+
+
+def log_time(what, t0):
+    try:
+        ss.setdefault("_log", []).append((what, round(time.time() - t0, 1)))
+        ss["_log"] = ss["_log"][-12:]
+    except Exception:
+        pass
 
 
 def _closes(df, tickers):
@@ -266,7 +283,7 @@ def _closes(df, tickers):
 
 
 def _yahoo_raw(ticker, start, end):
-    df = yf.download(ticker, start=start, end=end, interval="1mo", auto_adjust=True, progress=False)
+    df = yf.download(ticker, start=start, end=end, interval="1mo", auto_adjust=True, progress=False, timeout=10)
     if df is None or df.empty:
         return None
     s = df["Close"]
@@ -276,7 +293,9 @@ def _yahoo_raw(ticker, start, end):
 
 
 def _stooq_raw(ticker, start, end):
-    df = pd.read_csv(f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d")
+    import requests
+    rsp = requests.get(f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=m", timeout=6)
+    df = pd.read_csv(io.StringIO(rsp.text))
     if "Close" not in df.columns:
         return None
     s = df.set_index(pd.to_datetime(df["Date"]))["Close"]
@@ -310,15 +329,18 @@ def cached_many(kind, keys, fn, ttl, fail_ttl=3600):
     now = time.time()
     need = [k for k in dict.fromkeys(keys)
             if k not in box or now - box[k][0] > (ttl if box[k][1] is not None else fail_ttl)]
+    t0 = time.time()
     for k, v in zip(need, pmap(fn, need)):
         box[k] = (now, v)
+    if need:
+        log_time(f"{kind} ({len(need)})", t0)
     return {k: box[k][1] for k in keys}
 
 
 def hist_missing(tickers):
     box = _store().get("hist", {})
     now = time.time()
-    return [t for t in tickers if t not in box or now - box[t][0] > (12 * 3600 if box[t][1] is not None else 3600)]
+    return [t for t in tickers if t not in box or now - box[t][0] > (12 * 3600 if box[t][1] is not None else box[t][2])]
 
 
 def hist_many(tickers):
@@ -326,22 +348,31 @@ def hist_many(tickers):
     box = _store().setdefault("hist", {})
     need = hist_missing([t for t in dict.fromkeys(tickers) if t])
     if need:
-        now, got = time.time(), {}
-        try:
-            df = yf.download(need, start=HIST_START, interval="1mo", auto_adjust=True, progress=False, threads=True)
-            c = _closes(df, need)
-            for t in need:
-                if t in c.columns:
-                    s = to_monthly(c[t])
-                    if len(s) >= 13:
-                        got[t] = s
-        except Exception:
-            pass
+        now, got, t0 = time.time(), {}, time.time()
+        for i in range(0, len(need), 25):                  # in Paketen à 25, damit Yahoo nicht blockt
+            part = need[i:i + 25]
+            try:
+                df = yf.download(part, start=HIST_START, interval="1mo", auto_adjust=True,
+                                 progress=False, threads=True, timeout=10)
+                c = _closes(df, part)
+                for t in part:
+                    if t in c.columns:
+                        s = to_monthly(c[t])
+                        if len(s) >= 13:
+                            got[t] = s
+            except Exception:
+                pass
+        log_time(f"Kursverläufe Sammelabfrage ({len(got)}/{len(need)})", t0)
         rest = [t for t in need if t not in got]
-        for t, s in zip(rest, pmap(lambda t: _load_raw(t, HIST_START, date.today()), rest)):
-            got[t] = s
+        down = len(need) >= 4 and not got                  # Yahoo blockt gerade komplett → nicht 47× einzeln probieren
+        if rest and not down:
+            t0 = time.time()
+            for t, s in zip(rest, pmap(lambda t: _load_raw(t, HIST_START, date.today()), rest, budget=8)):
+                got[t] = s
+            log_time(f"Kursverläufe einzeln ({len(rest)})", t0)
+        ss["_yahoo_down"] = down
         for t in need:
-            box[t] = (now, got.get(t))
+            box[t] = (now, got.get(t), 120 if down else 1800)
     return {t: box[t][1] for t in tickers if t in box and box[t][1] is not None}
 
 
@@ -495,8 +526,9 @@ def quotes_many(tickers):
     need = [t for t in tickers if t not in box or now - box[t][0] > 900]
     if need:
         got = {}
+        t0 = time.time()
         try:
-            df = yf.download(need, period="5d", auto_adjust=False, progress=False, threads=True)
+            df = yf.download(need, period="5d", auto_adjust=False, progress=False, threads=True, timeout=10)
             c = _closes(df, need)
             for t in need:
                 if t in c.columns:
@@ -507,6 +539,7 @@ def quotes_many(tickers):
             pass
         for t in need:
             box[t] = (now, got.get(t))
+        log_time(f"Aktuelle Kurse ({len(got)}/{len(need)})", t0)
     prices = {t: box[t][1] for t in tickers if box[t][1] is not None}
     curs = currency_of(tuple(tickers))
     fxs = {cu: get_fx(cu) for cu in set(curs.values())}
@@ -813,6 +846,9 @@ def get_ctx():
     miss = hist_missing(list(allt))
     with st.spinner(f"Lade Kursverläufe für {len(miss)} Wertpapiere (einmalig) …" if miss else "Lade Kurse …"):
         series = dict(load_many(allt, start, end))
+    if ss.get("_yahoo_down"):
+        st.error("**Yahoo Finance antwortet gerade nicht** (meist ein kurzes Abfragelimit). "
+                 "Warte 1–2 Minuten und lade die Seite neu – bereits geladene Kurse bleiben gespeichert.")
     failed = [t for t in tickers + ([bench_t] if bench_t else []) if t not in series]
     bench = bench_t if bench_t in series else None
     for f in uploads or []:
@@ -4018,6 +4054,12 @@ pg = st.navigation(menu, expanded=True)
 pg.run()
 st.sidebar.caption((":material/dark_mode: Dunkles Design aktiv." if DARK else ":material/light_mode: Helles Design aktiv.")
                    + " Umschalten: Menü **⋮** oben rechts → **Settings** → **Theme**.")
+with st.sidebar.expander("⏱ Ladezeiten"):
+    st.caption("Wie lange die letzten Internet-Abfragen gedauert haben (Sekunden). Hilft, Langsamkeit zu finden.")
+    for w_, s_ in reversed(ss.get("_log", [])):
+        st.write(f"{s_:.1f} s · {w_}")
+    if not ss.get("_log"):
+        st.write("Noch nichts geladen – alles kam aus dem Speicher.")
 with st.sidebar.expander("Depot speichern & laden", icon=":material/save:"):
     st.caption("Deine Eingaben werden nicht auf dem Server gespeichert. Sichere sie als Datei und lade sie beim "
                "nächsten Besuch wieder hoch.")
