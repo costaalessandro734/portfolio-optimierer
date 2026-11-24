@@ -140,6 +140,46 @@ def parse_upload(file):
 
 
 # =====================================================================
+# Interpretation in Alltagssprache
+# =====================================================================
+def explain(lines):
+    with st.container(border=True):
+        st.markdown("**Was bedeutet das?**\n\n" + "\n\n".join(l for l in lines if l))
+
+
+def lvl_vol(v):
+    return ("sehr ruhig" if v < 0.08 else "eher ruhig" if v < 0.14 else "mittel schwankend" if v < 0.22
+            else "stark schwankend")
+
+
+def lvl_sh(s):
+    return ("schwach" if s < 0.3 else "in Ordnung" if s < 0.7 else "gut" if s < 1.2
+            else "außergewöhnlich gut – so hohe Werte halten selten dauerhaft")
+
+
+def reasons(i, up, mu, S, C, target):
+    """Begründet, warum Wertpapier i mehr (up=True) oder weniger Gewicht bekommt."""
+    vol = np.sqrt(np.diag(S))
+    shp = mu / vol
+    c = (C.sum(1) - 1) / max(1, len(mu) - 1)
+    r_vol = (vol[i] < np.median(vol)) if up else (vol[i] > np.median(vol))
+    r_sh = (shp[i] > np.median(shp)) if up else (shp[i] < np.median(shp))
+    r_c = (c[i] < np.median(c)) if up else (c[i] > np.median(c))
+    txt_vol = (f"schwankt weniger als deine anderen Werte ({pc(vol[i])} pro Jahr)" if up
+               else f"schwankt stärker als deine anderen Werte ({pc(vol[i])} pro Jahr)")
+    txt_sh = (f"viel Gewinn im Verhältnis zum Risiko (Ø {pc(mu[i])} pro Jahr)" if up
+              else f"wenig Gewinn im Verhältnis zum Risiko (Ø {pc(mu[i])} pro Jahr)")
+    txt_c = ("bewegt sich oft anders als deine übrigen Werte – das fängt Verluste ab" if up
+             else "bewegt sich sehr ähnlich wie deine übrigen Werte – streut das Risiko kaum")
+    order = [(r_vol, txt_vol), (r_c, txt_c), (r_sh, txt_sh)] if target == "Min-Varianz" else \
+            [(r_sh, txt_sh), (r_c, txt_c), (r_vol, txt_vol)]
+    hits = [t for ok, t in order if ok][:2]
+    if target == "Gleichgewichtet":
+        return "Grund: Bei gleichmäßiger Verteilung bekommt jedes Wertpapier gleich viel"
+    return ("Grund: " + "; ".join(hits)) if hits else "Grund: passt rechnerisch besser in die Mischung"
+
+
+# =====================================================================
 # Mathe
 # =====================================================================
 def solve(f, n, lo, hi, extra=()):
@@ -412,6 +452,50 @@ k4.metric("Gewinn pro Risiko", de(tm["Sharpe"], 2), sg(tm["Sharpe"] - cm["Sharpe
 st.caption(f"Dein jetziges Portfolio: Ø {pc(cm['Rendite p.a.'])} pro Jahr, Schwankung {pc(cm['Vol. p.a.'])}, "
            f"schlimmster Absturz −{pc(cm['Max. Drawdown'])}.")
 
+C = R.corr().values
+avg_c = round((C.sum() - len(assets)) / max(1, len(assets) * (len(assets) - 1)), 2) + 0.0
+big = int(np.argmax(cur))
+lines = [
+    f"**Dein jetziges Portfolio** ist {lvl_vol(cm['Vol. p.a.'])} (Schwankung {pc(cm['Vol. p.a.'])}). In den letzten "
+    f"{years} Jahren ist es im Schnitt um {pc(cm['Rendite p.a.'])} pro Jahr gewachsen. Der schlimmste Einbruch lag bei "
+    f"−{pc(cm['Max. Drawdown'])}: Aus {eur(V)} wären zwischenzeitlich {eur(V * (1 - cm['Max. Drawdown']))} geworden. "
+    f"Das Verhältnis von Gewinn zu Risiko war {lvl_sh(cm['Sharpe'])}.",
+    ("**Streuung:** Deine Wertpapiere bewegten sich stark gleichzeitig (Ø Korrelation " + de(avg_c, 2) + "). Wenn eins "
+     "fällt, fallen die anderen meist mit – die Streuung schützt dich kaum. Wertpapiere aus anderen Branchen, Ländern "
+     "oder Anlageklassen würden mehr bringen.") if avg_c > 0.6 else
+    ("**Streuung:** Deine Wertpapiere liefen oft unterschiedlich (Ø Korrelation " + de(avg_c, 2) + "). Das ist gut: "
+     "Verluste des einen werden teilweise von den anderen ausgeglichen.") if avg_c < 0.3 else
+    ("**Streuung:** Deine Wertpapiere hängen mittelstark zusammen (Ø Korrelation " + de(avg_c, 2) + "). Die Streuung "
+     "hilft etwas, aber in Krisen fallen sie wahrscheinlich gemeinsam."),
+    (f"**Klumpenrisiko:** {pc(cur[big], 0)} deines Geldes stecken in {label(assets[big])}. Läuft dieser eine Wert "
+     "schlecht, zieht er das ganze Portfolio mit.") if cur[big] > 0.4 else "",
+]
+dr, dv = tm["Rendite p.a."] - cm["Rendite p.a."], tm["Vol. p.a."] - cm["Vol. p.a."]
+if moves:
+    if dr >= 0 and dv <= 0:
+        trade = "Der Vorschlag wäre in der Vergangenheit **klar besser** gewesen: mehr Gewinn bei weniger Schwankung."
+    elif dr >= 0:
+        trade = ("Der Vorschlag bringt **mehr Gewinn, aber auch mehr Schwankung**. Du tauschst also Ruhe gegen Rendite – "
+                 "das lohnt sich nur, wenn du Einbrüche gelassen aussitzen kannst.")
+    elif dv <= 0:
+        trade = ("Der Vorschlag ist **ruhiger, bringt dafür etwas weniger Gewinn**. Sinnvoll, wenn dir Verluste "
+                 "schlaflose Nächte bereiten.")
+    else:
+        trade = "Der Vorschlag wäre hier eher schlechter – das kommt selten vor; prüfe deine Eingaben und Grenzen."
+    ups = sorted([i for i in range(len(assets)) if d[i] >= 0.005], key=lambda i: -d[i])[:2]
+    downs = sorted([i for i in range(len(assets)) if d[i] <= -0.005], key=lambda i: d[i])[:2]
+    why = [f"- **{label(assets[i])}** bekommt mehr ({pc(cur[i], 0)} → {pc(tw[i], 0)}). "
+           f"{reasons(i, True, mu, S, C, target)}." for i in ups] + \
+          [f"- **{label(assets[i])}** bekommt weniger ({pc(cur[i], 0)} → {pc(tw[i], 0)}). "
+           f"{reasons(i, False, mu, S, C, target)}." for i in downs]
+    cap_i = [i for i in range(len(assets)) if tw[i] >= hi[i] - 0.001 and hi[i] < 1]
+    capped = [label(assets[i]) for i in cap_i]
+    lines += [trade, "**Warum diese Änderungen?**\n" + "\n".join(why),
+              (f"Bei {', '.join(capped)} stößt der Vorschlag an die Obergrenze von {pc(hi[cap_i[0]], 0)}. "
+               "Ohne Grenze würde das Modell noch mehr hineinstecken – ein Zeichen, dass es stark auf die gute "
+               "Vergangenheit dieses Werts setzt. Genau davor schützt die Grenze.") if capped and target == "Max-Sharpe" else ""]
+explain(lines)
+
 st.subheader(f"Was könnte in {hor} Jahren aus {eur(V)} werden?",
              help="Simulation: Aus den echten Monaten der Vergangenheit werden 2000 mögliche Zukünfte "
                   "zusammengewürfelt. Die Spanne zeigt, wo 9 von 10 Fällen landen. Keine Vorhersage: "
@@ -424,6 +508,23 @@ c1.markdown(f"**Jetziges Portfolio**  \nwahrscheinlich etwa **{eur(a['Median'])}
 c2.markdown(f"**Mit dem Vorschlag**  \nwahrscheinlich etwa **{eur(b['Median'])}**  \n"
             f"in 9 von 10 Fällen zwischen {eur(b['5 %'])} und {eur(b['95 %'])}  \n"
             f"Risiko, am Ende weniger als eingesetzt zu haben: {pc(b['P(Verlust)'], 0)}")
+cagr = (b["Median"] / V) ** (1 / hor) - 1
+wa, wb = a["95 %"] - a["5 %"], b["95 %"] - b["5 %"]
+explain([
+    f"Im mittleren Fall würden aus {eur(V)} mit dem Vorschlag etwa **{eur(b['Median'])}** – das entspricht rund "
+    f"{pc(cagr)} pro Jahr. Im schlechten Fall (nur 1 von 20 Simulationen ist noch schlechter) wären es "
+    f"{eur(b['5 %'])}, im guten Fall {eur(b['95 %'])}.",
+    "Die Spanne ist groß, und das ist bei Aktien normal: Niemand weiß, welche Jahre kommen. Je länger du anlegst, "
+    "desto kleiner wird meist das Risiko, am Ende im Minus zu sein." if hor < 10 else
+    "Bei so einem langen Zeitraum ist ein Verlust am Ende eher unwahrscheinlich – zwischendurch kann es trotzdem "
+    "deutlich nach unten gehen.",
+    (f"Mit dem Vorschlag wird die Spanne **enger** ({eur(wb)} statt {eur(wa)}): Das Ergebnis ist besser planbar."
+     if wb < wa * 0.95 else
+     f"Mit dem Vorschlag wird die Spanne **breiter** ({eur(wb)} statt {eur(wa)}): Mehr Chance, aber auch mehr Risiko."
+     if wb > wa * 1.05 else "Die Spanne bleibt mit dem Vorschlag ungefähr gleich."),
+    "Achtung: Die Simulation setzt voraus, dass die Zukunft ähnlich verläuft wie die ausgewerteten Jahre. Waren das "
+    "besonders gute Börsenjahre, sind die Zahlen zu optimistisch.",
+])
 
 st.subheader("Hätte der Vorschlag wirklich geholfen?",
              help="Backtest: Der Vorschlag wird nur mit den älteren 70 % der Daten berechnet und dann auf den "
@@ -444,6 +545,15 @@ else:
         st.error(f"**Nein.** Im Testzeitraum ({per}) wäre dein jetziges Portfolio besser gewesen "
                  f"(Gewinn pro Risiko {de(bt_c['Sharpe'], 2)} statt {de(bt_t['Sharpe'], 2)}). Der Vorschlag passt "
                  "vor allem zur Vergangenheit – sei vorsichtig damit.")
+    explain([
+        "Warum dieser Test so wichtig ist: Jede Optimierung findet im Nachhinein die „perfekte“ Mischung – das ist "
+        "leicht. Die echte Frage ist, ob sie auch ohne Wissen über die Zukunft funktioniert hätte.",
+        "Ein **Ja** heißt nicht, dass es weiter klappt, ist aber ein gutes Zeichen. Ein **Nein** ist eine Warnung: "
+        "Der Vorschlag beruht dann vor allem auf Zufällen der Vergangenheit. In dem Fall ist „Möglichst ruhig“ oder "
+        "„Einfach gleichmäßig verteilen“ oft die vernünftigere Wahl.",
+        f"Der Testzeitraum umfasst nur {T - s_} Monate – das ist kurz. Ein einzelnes gutes oder schlechtes Jahr kann "
+        "das Ergebnis stark beeinflussen." if T - s_ < 48 else "",
+    ])
 
 st.caption("Wichtig: Alle Zahlen beruhen auf vergangenen Kursen. Was früher gut lief, muss nicht so weiterlaufen. "
            "Gebühren und Steuern sind nicht berücksichtigt. Das ist keine Anlageberatung.")
@@ -483,6 +593,19 @@ with t0:
                      yaxis_title="Erw. Rendite p.a.", xaxis_tickformat=".0%", yaxis_tickformat=".0%",
                      legend=dict(orientation="h", y=-0.18))
     st.plotly_chart(fg, width="stretch")
+    cv, cr = np.sqrt(cur @ S @ cur), cur @ mu
+    gap = np.interp(cv, F[:, 0], F[:, 1]) - cr if F[0, 0] <= cv <= F[-1, 0] else F[-1, 1] - cr if cv > F[-1, 0] else 0
+    mv_ = W["Min-Varianz"]
+    explain([
+        f"Dein Portfolio (roter Punkt) liegt bei {pc(cv)} Schwankung und {pc(cr)} erwarteter Rendite.",
+        (f"Bei gleicher Schwankung wären bis zu **{de(gap * 100)} Prozentpunkte mehr Rendite pro Jahr** möglich "
+         "gewesen – so weit liegt dein Punkt unter der Linie. Das ist der „verschenkte“ Teil.") if gap > 0.005 else
+        "Dein Portfolio liegt praktisch auf der Efficient Frontier – es war bereits effizient aufgeteilt.",
+        f"Das ruhigste mögliche Portfolio (Min-Varianz, offener Kreis) hätte nur {pc(np.sqrt(mv_ @ S @ mv_))} "
+        "geschwankt.",
+        "Wichtig: Die Linie ist im Nachhinein berechnet. Vor allem der obere Teil (hohe Rendite) beruht auf "
+        "geschätzten Renditen, die sich selten so wiederholen.",
+    ])
 
 with t1:
     st.subheader("Style Analysis (rollierend)",
@@ -504,6 +627,17 @@ with t1:
         st.dataframe(pd.DataFrame({"Wertpapier": [label(t) for t in assets], "Gesamtzeitraum": [pc(x) for x in w_all],
                                    "Letztes Fenster": [pc(x) if x == x else "–" for x in last]}),
                      hide_index=True, width="stretch")
+        top = np.argsort(-w_all)[:2]
+        explain([
+            f"Den Index {bench} bildet man mit deinen Wertpapieren am besten vor allem mit "
+            + " und ".join(f"{label(assets[i])} ({pc(w_all[i], 0)})" for i in top) + " nach.",
+            f"R² = {de(r2, 2)}: " + ("Die Mischung erklärt den Index sehr gut." if r2 > 0.8 else
+                                     "Die Mischung erklärt den Index nur teilweise – deine Werte decken ihn nicht ganz ab."
+                                     if r2 > 0.5 else "Die Mischung erklärt den Index kaum – deine Werte haben wenig "
+                                     "mit ihm zu tun."),
+            "Im Diagramm siehst du, wie sich der „Stil“ über die Zeit verschiebt. Starke Sprünge heißen: Der Index "
+            "verhielt sich mal wie die eine, mal wie die andere Gruppe deiner Werte." if T >= win + 3 else "",
+        ])
 
 with t2:
     st.subheader("Risikokennzahlen (in-sample)",
@@ -513,6 +647,13 @@ with t2:
     if y is not None:
         rk.loc[f"Benchmark {bench}"] = metrics(y, rf)
     st.dataframe(rk.style.format({c: (lambda x: de(x, 2)) if c == "Sharpe" else pc for c in rk.columns}), width="stretch")
+    explain([
+        f"**VaR 95 %** deines jetzigen Portfolios: {pc(cm['VaR 95 %'])}. Übersetzt: In etwa 1 von 20 Monaten verlierst du "
+        f"mehr als **{eur(cm['VaR 95 %'] * V)}**. In diesen schlechten Monaten waren es im Schnitt "
+        f"{eur(cm['CVaR 95 %'] * V)} (CVaR).",
+        "Die optimierten Strategien sehen in dieser Tabelle besser aus, als sie in Wirklichkeit wären, weil sie auf "
+        "genau diesen Daten berechnet wurden (in-sample). Vergleiche deshalb den Backtest.",
+    ])
     st.subheader("Gewichte je Strategie")
     st.dataframe(pd.DataFrame(W, index=[label(t) for t in assets]).style.format(pc), width="stretch")
 
@@ -527,6 +668,17 @@ with t3:
         st.plotly_chart(fb, width="stretch")
         bt = pd.DataFrame(BT).T[["Rendite p.a.", "Vol. p.a.", "Sharpe", "Max. Drawdown"]]
         st.dataframe(bt.style.format({c: (lambda x: de(x, 2)) if c == "Sharpe" else pc for c in bt.columns}), width="stretch")
+        best = bt["Sharpe"].idxmax()
+        best_txt = {"Aktuell": "Dein jetziges Portfolio war im Test am besten – Umschichten hätte hier nicht geholfen.",
+                    "Gleichgewichtet": "Gleichmäßig verteilen war am besten. Das ist typisch: Es braucht keine Schätzung "
+                                       "und kann sich deshalb nicht verschätzen.",
+                    "Min-Varianz": "Das ruhigste Portfolio war am besten. Das ist häufig so: Es schätzt keine Renditen "
+                                   "und ist dadurch robuster als Max-Sharpe.",
+                    "Benchmark": "Der Index selbst war am besten – ein breiter ETF wäre die einfachste Lösung gewesen."}
+        explain([f"Im Testzeitraum hatte **{best}** das beste Verhältnis von Gewinn zu Risiko (Sharpe "
+                 f"{de(bt.loc[best, 'Sharpe'], 2)}).",
+                 best_txt.get(best, "Dass eine renditebasierte Strategie vorne liegt, kann am Testzeitraum liegen – "
+                                    "bei einem anderen Zeitraum kann es anders aussehen.")])
 
 with t4:
     st.subheader(f"Bootstrap: Endwert nach {hor} Jahren (Start {eur(V)})")
