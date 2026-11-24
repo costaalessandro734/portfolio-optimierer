@@ -48,6 +48,10 @@ def eur(x):
     return de(x, 0) + " €"
 
 
+def eur2(x):
+    return "–" if x is None or x != x else de(x, 2) + " €"
+
+
 def pc(x, d=1):
     return de(x * 100, d) + " %"
 
@@ -71,7 +75,12 @@ ss.setdefault("imp", 0)
 ss.setdefault("prefer_de", True)
 ss.setdefault("replace_sel", True)
 ss.setdefault("sel", [POPULAR[n] for n in ["Apple", "Microsoft", "iShares MSCI World ETF", "Allianz", "Coca-Cola"]])
-for k in ("sel", "bulk", "prefer_de", "replace_sel", "q"):      # Widgets auf anderen Seiten nicht vergessen
+ss.setdefault("pos", {})          # Ticker -> {"qty", "cost", "date"}
+ss.setdefault("input_mode", "Einfach: nur Betrag in €")
+ss.setdefault("tax", 26.4)
+ss.setdefault("newmoney", 0.0)
+ss.setdefault("nosell", False)
+for k in ("sel", "bulk", "prefer_de", "replace_sel", "q", "input_mode", "tax", "newmoney", "nosell"):      # Widgets auf anderen Seiten nicht vergessen
     if k in ss:
         ss[k] = ss[k]
 
@@ -113,6 +122,11 @@ GLOSSAR = {
     "Beta": "Wie stark eine Aktie im Vergleich zum Gesamtmarkt schwankt. 1 = wie der Markt.",
     "Anleihen": "Kredite an Staaten oder Unternehmen, die Zinsen zahlen. Schwanken meist weniger als Aktien.",
     "ETF": "Ein börsengehandelter Fonds, der viele Wertpapiere bündelt (z. B. alle großen Firmen der Welt).",
+    "Ø Kaufkurs (Einstandskurs)": "Was du im Durchschnitt pro Stück bezahlt hast – bei mehreren Käufen der "
+                                  "Mittelwert. Steht in deinem Depot.",
+    "Realisierter Gewinn": "Ein Gewinn wird erst „echt“, wenn du verkaufst. Erst dann fällt auch Steuer an.",
+    "Rebalancing": "Das Depot wieder auf die gewünschte Aufteilung bringen – durch Verkaufen oder steuerschonend nur "
+                   "durch gezieltes Nachkaufen mit neuem Geld.",
     "Ticker / ISIN": "Ticker ist das Börsenkürzel bei Yahoo (z. B. AAPL, SAP.DE). Die ISIN ist die weltweit "
                      "eindeutige Nummer eines Wertpapiers (z. B. US0378331005) – steht in deinem Depot.",
 }
@@ -237,6 +251,81 @@ def import_list():
         ok.append(f"{parts[0]} → {hit['name']} ({hit['sym']})")
     ss.imp += 1
     ss.import_msg = (ok, bad)
+
+
+# =====================================================================
+# Aktuelle Kurse, Wechselkurse, Depot
+# =====================================================================
+EUR_SUFFIX = (".DE", ".F", ".PA", ".AS", ".MC", ".MI", ".BR", ".VI", ".HE", ".LS", ".IR")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_quote(t):
+    """Letzter Kurs (nicht dividendenbereinigt) und Währung."""
+    price = None
+    try:
+        df = yf.download(t, period="5d", auto_adjust=False, progress=False)
+        s = df["Close"]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        price = float(s.iloc[-1]) if len(s) else None
+    except Exception:
+        pass
+    try:
+        cur_ = yf.Ticker(t).info.get("currency")
+    except Exception:
+        cur_ = None
+    return price, cur_ or ("EUR" if t.upper().endswith(EUR_SUFFIX) else "USD")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fx(cur_):
+    """Euro pro 1 Einheit der Kurswährung (z. B. USD → 0,92)."""
+    if cur_ in (None, "EUR"):
+        return 1.0
+    div = 1.0
+    if cur_ in ("GBp", "GBX"):
+        cur_, div = "GBP", 100.0
+    try:
+        df = yf.download(f"EUR{cur_.upper()}=X", period="5d", progress=False)
+        s = df["Close"]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return 1.0 / (float(s.iloc[-1]) * div) if len(s) else None
+    except Exception:
+        return None
+
+
+def depot(assets):
+    """Tabelle mit Stück, Kaufkurs, aktuellem Wert und Gewinn/Verlust je Position (alles in €)."""
+    rows = []
+    for t in assets:
+        p_ = ss.pos.get(t, {})
+        qty, cost, dt = float(p_.get("qty") or 0), float(p_.get("cost") or 0), p_.get("date")
+        price, cur_ = get_quote(t)
+        fx = get_fx(cur_)
+        pe = price * fx if price is not None and fx is not None else None
+        value = qty * pe if pe is not None else 0.0
+        inv = qty * cost
+        gain = value - inv if inv > 0 and pe is not None else None
+        yrs = (date.today() - dt).days / 365.25 if dt else None
+        pa = ((value / inv) ** (1 / yrs) - 1) if gain is not None and yrs and yrs >= 0.5 and value > 0 else None
+        rows.append({"t": t, "qty": qty, "cost": cost, "date": dt, "price": price, "cur": cur_, "fx": fx,
+                     "price_eur": pe, "value": value, "invested": inv, "gain": gain,
+                     "gain_pct": gain / inv if gain is not None else None, "years": yrs, "pa": pa})
+    return pd.DataFrame(rows).set_index("t")
+
+
+def plan(cur_v, tw, new_money, no_sell):
+    """Euro-Beträge pro Position, um auf die Zielgewichte zu kommen (optional nur durch Nachkaufen)."""
+    total = cur_v.sum() + new_money
+    want = tw * total
+    if not no_sell:
+        return want - cur_v
+    gap = np.maximum(0, want - cur_v)
+    return new_money * gap / gap.sum() if gap.sum() > 0 else tw * new_money
 
 
 # =====================================================================
@@ -461,7 +550,12 @@ def get_ctx():
     if T < 25:
         return ctx | {"err": f"Für diese Auswahl gibt es nur {T} gemeinsame Monate Kursgeschichte (mindestens 25 "
                              "nötig). Schau mehr Jahre zurück oder entferne sehr junge Wertpapiere."}
-    vals = np.array([float(ss.amounts.get(t, 1000.0)) for t in assets])
+    dep = None
+    if ss.input_mode.startswith("Genau"):
+        dep = depot(assets)
+        vals = dep["value"].values.astype(float)
+    else:
+        vals = np.array([float(ss.amounts.get(t, 1000.0)) for t in assets])
     V = vals.sum()
     if V <= 0:
         return ctx | {"err": "Trag auf der Seite **Mein Portfolio** bei mindestens einem Wertpapier einen Betrag ein."}
@@ -479,7 +573,7 @@ def get_ctx():
         st.warning("Für „Benchmark nachbilden“ fehlt ein Benchmark – es wird „Bestes Verhältnis“ verwendet.")
         target = "Max-Sharpe"
     res = core(R, y, cur, lo, hi, rf, split, hor, V)
-    return ctx | res | dict(R=R, y=y, T=T, V=V, cur=cur, lo=lo, hi=hi, dmax=dmax, target=target,
+    return ctx | res | dict(dep=dep, R=R, y=y, T=T, V=V, cur=cur, lo=lo, hi=hi, dmax=dmax, target=target,
                             tw=res["W"][target], names=[label(t) for t in assets], C=R.corr().values,
                             goal_txt=ss.goal if target == GOALS[ss.goal] else "Bestes Verhältnis von Gewinn zu Risiko")
 
@@ -551,22 +645,88 @@ def page_input():
         st.info("Füge oben Wertpapiere hinzu.")
         return
     dmax = 40.0 if len(assets) >= 3 else 100.0
-    base = pd.DataFrame({"Wertpapier": [label(t) for t in assets], "Ticker": assets,
-                         "Wert in €": [float(ss.amounts.get(t, 1000.0)) for t in assets]})
-    cfg = {"Wert in €": st.column_config.NumberColumn("Wert in €", min_value=0.0, step=100.0, format="%.0f €",
-                                                      help="Aktueller Wert dieser Position. Grobe Werte reichen.")}
+    st.radio("Wie willst du dein Depot eingeben?", ["Einfach: nur Betrag in €", "Genau: Stückzahl & Kaufkurs"],
+             key="input_mode", horizontal=True,
+             help="Einfach: Du trägst nur den heutigen Wert in Euro ein. Genau: Du trägst ein, wie viele Stück du "
+                  "hast und zu welchem Durchschnittskurs du gekauft hast. Dann holt die App den aktuellen Kurs, "
+                  "berechnet deinen Gewinn oder Verlust seit Kauf und kann Steuern bei Verkäufen abschätzen.")
+    genau = ss.input_mode.startswith("Genau")
+    NC = st.column_config.NumberColumn
+    if genau:
+        dep = depot(assets)
+        base = pd.DataFrame({
+            "Wertpapier": [label(t) for t in assets], "Ticker": assets,
+            "Stück": [dep.loc[t, "qty"] for t in assets],
+            "Ø Kaufkurs in €": [dep.loc[t, "cost"] for t in assets],
+            "Gekauft am": [pd.to_datetime(dep.loc[t, "date"]) if dep.loc[t, "date"] else pd.NaT for t in assets],
+            "Kurs heute in €": [dep.loc[t, "price_eur"] for t in assets],
+            "Wert in €": [dep.loc[t, "value"] for t in assets],
+            "Gewinn/Verlust €": [dep.loc[t, "gain"] for t in assets],
+            "Gewinn/Verlust %": [(dep.loc[t, "gain_pct"] * 100) if dep.loc[t, "gain_pct"] is not None else None
+                                 for t in assets]})
+        cfg = {"Stück": NC(min_value=0.0, step=1.0, format="%.4g",
+                           help="Wie viele Anteile du besitzt. Bruchstücke (z. B. 3,25 aus Sparplänen) sind möglich."),
+               "Ø Kaufkurs in €": NC(min_value=0.0, step=0.01, format="%.2f €",
+                                     help="Dein durchschnittlicher Einstandskurs pro Stück in Euro, so wie er in deinem "
+                                          "Depot steht (inkl. Kaufgebühren, wenn dein Broker sie einrechnet)."),
+               "Gekauft am": st.column_config.DateColumn(format="DD.MM.YYYY",
+                                                         help="Optional. Bei mehreren Käufen das Datum des ersten Kaufs. "
+                                                              "Damit berechnet die App den Gewinn pro Jahr."),
+               "Kurs heute in €": NC(format="%.2f €", help="Letzter Kurs von Yahoo, bei Fremdwährung in Euro "
+                                                           "umgerechnet. Wird alle 15 Minuten aktualisiert."),
+               "Wert in €": NC(format="%.0f €", help="Stück × Kurs heute."),
+               "Gewinn/Verlust €": NC(format="%+.0f €", help="Wert heute minus investiertes Geld (Stück × Kaufkurs)."),
+               "Gewinn/Verlust %": NC(format="%+.1f %%", help="Gewinn oder Verlust im Verhältnis zum investierten Geld.")}
+        disabled = ["Wertpapier", "Ticker", "Kurs heute in €", "Wert in €", "Gewinn/Verlust €", "Gewinn/Verlust %"]
+    else:
+        base = pd.DataFrame({"Wertpapier": [label(t) for t in assets], "Ticker": assets,
+                             "Wert in €": [float(ss.amounts.get(t, 1000.0)) for t in assets]})
+        cfg = {"Wert in €": NC("Wert in €", min_value=0.0, step=100.0, format="%.0f €",
+                               help="Aktueller Wert dieser Position. Grobe Werte reichen.")}
+        disabled = ["Wertpapier", "Ticker"]
     if expert:
         base["Min %"] = [ss.bounds.get(t, (0.0, dmax))[0] for t in assets]
         base["Max %"] = [ss.bounds.get(t, (0.0, dmax))[1] for t in assets]
         for col in ("Min %", "Max %"):
-            cfg[col] = st.column_config.NumberColumn(col, min_value=0.0, max_value=100.0, step=1.0,
-                                                     help="Grenzen für das Gewicht in allen Optimierungen.")
-    ed = st.data_editor(base, key=f"ed_{expert}_{ss.imp}_" + "_".join(assets), hide_index=True,
-                        disabled=["Wertpapier", "Ticker"], column_config=cfg, width="stretch")
+            cfg[col] = NC(col, min_value=0.0, max_value=100.0, step=1.0,
+                          help="Grenzen für das Gewicht in allen Optimierungen.")
+    ed = st.data_editor(base, key=f"ed_{expert}_{genau}_{ss.imp}_" + "_".join(assets), hide_index=True,
+                        disabled=disabled, column_config=cfg, width="stretch")
+    changed = False
     for _, row in ed.iterrows():
-        ss.amounts[row["Ticker"]] = float(row["Wert in €"] or 0)
+        t = row["Ticker"]
+        if genau:
+            dt = row["Gekauft am"]
+            new = {"qty": float(row["Stück"]) if row["Stück"] == row["Stück"] and row["Stück"] is not None else 0.0,
+                   "cost": float(row["Ø Kaufkurs in €"]) if row["Ø Kaufkurs in €"] == row["Ø Kaufkurs in €"]
+                   and row["Ø Kaufkurs in €"] is not None else 0.0,
+                   "date": None if dt is None or pd.isna(dt) else pd.Timestamp(dt).date()}
+            if ss.pos.get(t) != new:
+                ss.pos[t], changed = new, True
+        else:
+            ss.amounts[t] = float(row["Wert in €"] or 0)
         if expert:
-            ss.bounds[row["Ticker"]] = (float(row["Min %"] or 0), float(row["Max %"] if row["Max %"] == row["Max %"] else 100))
+            ss.bounds[t] = (float(row["Min %"] or 0), float(row["Max %"] if row["Max %"] == row["Max %"] else 100))
+    if changed:
+        st.rerun()
+    if genau:
+        dep = depot(assets)
+        miss = [label(t) for t in assets if dep.loc[t, "price_eur"] is None]
+        if miss:
+            st.warning("Für " + ", ".join(miss) + " konnte kein aktueller Kurs oder Wechselkurs geladen werden.")
+        inv, val = dep["invested"].sum(), dep["value"].sum()
+        nocost = [label(t) for t in assets if dep.loc[t, "qty"] > 0 and dep.loc[t, "cost"] <= 0]
+        if nocost:
+            st.caption("Ohne Kaufkurs (zählt nicht zum Gewinn/Verlust): " + ", ".join(nocost))
+        if inv > 0:
+            g = float(dep["gain"].dropna().sum())
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Depotwert heute", eur(val), help="Summe aller Positionen zum aktuellen Kurs.")
+            m2.metric("Investiert", eur(inv), help="Summe aus Stück × Ø Kaufkurs.")
+            m3.metric("Gewinn / Verlust", ("+" if g >= 0 else "−") + eur(abs(g)), f"{sg(g / inv * 100)} %",
+                      help="Wert heute minus investiertes Geld. Details auf der Seite „Mein Depot“.")
+        elif val == 0:
+            st.info("Trag bei jedem Wertpapier ein, wie viele **Stück** du hast und deinen **Ø Kaufkurs**.")
     if not expert and dmax < 100:
         st.caption(f"Damit nicht alles auf eine Karte gesetzt wird, steckt der Vorschlag höchstens {de(dmax, 0)} % in "
                    "ein einzelnes Wertpapier. Im Expertenmodus kannst du die Grenzen selbst festlegen.")
@@ -582,6 +742,104 @@ def page_input():
     st.page_link(P_OVER, label="Weiter zu Übersicht & Vorschlag", icon=":material/arrow_forward:")
 
 
+
+def page_depot():
+    head("Mein Depot", "Wie stehen deine Positionen seit dem Kauf? Gewinne, Verluste und wie stark jede Position "
+                       "dein Depot prägt.",
+         "Kurse von Yahoo Finance (alle 15 Minuten aktualisiert), Fremdwährungen zum aktuellen Wechselkurs in Euro "
+         "umgerechnet. Dein Kaufkurs wird so übernommen, wie du ihn eingetragen hast.")
+    if not ss.input_mode.startswith("Genau"):
+        st.info("Für diese Seite brauchst du die **genaue Eingabe** (Stückzahl & Kaufkurs). Stell sie auf "
+                "**Mein Portfolio** unter Schritt 2 um.")
+        st.page_link(P_INPUT, label="Zu „Mein Portfolio“", icon=":material/edit:")
+        return
+    assets = [t for t in dict.fromkeys(ss.sel)]
+    with st.spinner("Lade aktuelle Kurse …"):
+        dep = depot(assets)
+    dep = dep[(dep["qty"] > 0)]
+    if dep.empty:
+        st.info("Trag auf **Mein Portfolio** bei deinen Wertpapieren Stückzahl und Ø Kaufkurs ein.")
+        st.page_link(P_INPUT, label="Zu „Mein Portfolio“", icon=":material/edit:")
+        return
+    val, inv = dep["value"].sum(), dep.loc[dep["invested"] > 0, "invested"].sum()
+    known = dep[dep["gain"].notna()]
+    g = known["gain"].sum()
+    nocost = [label(t) for t in dep.index if dep.loc[t, "cost"] <= 0]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Depotwert heute", eur(val), help="Summe aller Positionen zum aktuellen Kurs in Euro.")
+    k2.metric("Investiert", eur(inv), help="Summe aus Stück × Ø Kaufkurs.")
+    k3.metric("Gewinn / Verlust", ("+" if g >= 0 else "−") + eur(abs(g)), f"{sg(g / inv * 100) if inv else '–'} %",
+              help="Wert heute minus investiertes Geld, über alle Positionen mit Kaufkurs.")
+    k4.metric("Positionen im Plus", f"{int((known['gain'] > 0).sum())} von {len(known)}",
+              help="Wie viele deiner Positionen aktuell über dem Kaufkurs stehen.")
+
+    if nocost:
+        st.caption("Ohne Kaufkurs (zählt nicht zu Gewinn/Verlust): " + ", ".join(nocost) + ". Trag den Ø Kaufkurs auf "
+                   "„Mein Portfolio“ nach.")
+    names = [label(t) for t in dep.index]
+    rows = []
+    for t, n in zip(dep.index, names):
+        r_ = dep.loc[t]
+        rows.append({"Wertpapier": n, "Stück": de(r_["qty"], 2), "Ø Kaufkurs": eur2(r_["cost"]),
+                     "Kurs heute": eur2(r_["price_eur"]), "Wert": eur(r_["value"]), "Anteil": pc(r_["value"] / val, 0),
+                     "Investiert": eur(r_["invested"]) if r_["invested"] else "–",
+                     "Gewinn/Verlust": (("+" if r_["gain"] >= 0 else "−") + eur(abs(r_["gain"]))) if r_["gain"] is not None and r_["gain"] == r_["gain"] else "–",
+                     "in %": (sg(r_["gain_pct"] * 100) + " %") if r_["gain_pct"] is not None and r_["gain_pct"] == r_["gain_pct"] else "–",
+                     "Gekauft": r_["date"].strftime("%d.%m.%Y") if r_["date"] else "–",
+                     "pro Jahr": (sg(r_["pa"] * 100) + " %") if r_["pa"] is not None and r_["pa"] == r_["pa"] else "–"})
+    TC = st.column_config.TextColumn
+    st.subheader("Deine Positionen", help="Alle Beträge in Euro.")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=min(700, 42 + 36 * len(rows)),
+                 column_config={"Anteil": TC(help="Anteil am gesamten Depotwert."),
+                                "Gewinn/Verlust": TC(help="Wert heute minus investiertes Geld. Noch nicht realisiert – "
+                                                          "erst beim Verkauf wird daraus ein echter Gewinn oder Verlust."),
+                                "pro Jahr": TC(help="Durchschnittlicher Gewinn pro Jahr seit dem Kaufdatum (nur wenn "
+                                                    "ein Datum eingetragen ist und der Kauf mindestens ein halbes Jahr "
+                                                    "zurückliegt).")})
+    if len(known):
+        st.subheader("Gewinn und Verlust je Position", help="Grün = im Plus, Rot = im Minus seit Kauf.")
+        kk = known.sort_values("gain")
+        fg = go.Figure(go.Bar(y=[label(t) for t in kk.index], x=kk["gain"], orientation="h",
+                              marker_color=["#0b7a3b" if x >= 0 else "#e8361b" for x in kk["gain"]],
+                              text=[("+" if x >= 0 else "−") + eur(abs(x)) for x in kk["gain"]], textposition="outside"))
+        fg.update_layout(height=80 + 50 * len(kk), margin=dict(l=10, r=40, t=10, b=10), xaxis_title="€",
+                         separators=",.", font=dict(size=15))
+        st.plotly_chart(fg, width="stretch")
+    st.subheader("Wie dein Geld verteilt ist", help="Größe der Kachel = Wert der Position. Farbe = Gewinn oder Verlust "
+                                                    "in Prozent seit Kauf.")
+    gp = [float(x * 100) if x is not None and x == x else 0.0 for x in dep["gain_pct"]]
+    tm = go.Figure(go.Treemap(labels=names, parents=[""] * len(names), values=dep["value"].values,
+                              marker=dict(colors=gp, colorscale=[[0, "#e8361b"], [0.5, "#f1f1f1"], [1, "#0b7a3b"]],
+                                          cmid=0, showscale=True, colorbar=dict(title="% seit Kauf")),
+                              texttemplate="<b>%{label}</b><br>%{value:,.0f} €", textfont=dict(size=16)))
+    tm.update_layout(height=460, margin=dict(l=10, r=10, t=10, b=10), separators=",.")
+    st.plotly_chart(tm, width="stretch")
+
+    lines = []
+    if len(known):
+        best, worst = known["gain_pct"].astype(float).idxmax(), known["gain_pct"].astype(float).idxmin()
+        lines.append(f"Insgesamt liegst du **{('im Plus' if g >= 0 else 'im Minus')}: {('+' if g >= 0 else '−')}{eur(abs(g))}** "
+                     f"({sg(g / inv * 100)} %) auf {eur(inv)} investiertes Geld.")
+        lines.append(f"Bester Wert: **{label(best)}** mit {sg(known.loc[best, 'gain_pct'] * 100)} %. "
+                     f"Schwächster Wert: **{label(worst)}** mit {sg(known.loc[worst, 'gain_pct'] * 100)} %.")
+    top = dep["value"].idxmax()
+    if dep.loc[top, "value"] / val > 0.3:
+        gpct = dep.loc[top, "gain_pct"]
+        lines.append(f"**{label(top)}** macht inzwischen **{pc(dep.loc[top, 'value'] / val, 0)}** deines Depots aus"
+                     + (" – vor allem, weil der Wert stark gestiegen ist." if gpct is not None and gpct == gpct and gpct > 0.5 else ".")
+                     + " Gewinner wachsen mit der Zeit zu großen Klumpen. Auf **Übersicht & Vorschlag** siehst du, ob "
+                       "und wie du das ausgleichen könntest.")
+    losers = known[known["gain_pct"].astype(float) < -0.2]
+    if len(losers):
+        lines.append("Positionen mit über 20 % Verlust: " + ", ".join(label(t) for t in losers.index) + ". Frag dich "
+                     "ehrlich: Würdest du diese Aktie **heute** kaufen? Wenn nicht, ist Festhalten nur, um den Verlust "
+                     "nicht „wahr“ zu machen, ein bekannter Denkfehler. Verkaufte Verluste lassen sich außerdem mit "
+                     "Gewinnen steuerlich verrechnen.")
+    lines.append("Solange du nicht verkaufst, sind Gewinne und Verluste nur auf dem Papier. Steuern fallen erst beim "
+                 "Verkauf an – das berücksichtigt die Umschichtung auf **Übersicht & Vorschlag**.")
+    explain(lines)
+
+
 def page_overview():
     c = ready()
     R, cur, tw, V, M, W, target = c["R"], c["cur"], c["tw"], c["V"], c["M"], c["W"], c["target"]
@@ -590,14 +848,42 @@ def page_overview():
     head("Übersicht & Vorschlag", f"Ziel: <b>{c['goal_txt']}</b>. Hier siehst du auf einen Blick, wie dein Portfolio "
                                   f"in den letzten {years} Jahren lief und was du ändern könntest.")
     d = tw - cur
-    moves = [(names[i], d[i] * V) for i in range(len(assets)) if abs(d[i]) >= 0.005]
+    dep = c["dep"]
+    with st.container(border=True):
+        st.markdown("**Wie willst du umschichten?**")
+        o1, o2, o3 = st.columns(3)
+        newm = o1.number_input("Neues Geld zum Investieren (€)", min_value=0.0, step=100.0, key="newmoney",
+                               help="Willst du zusätzliches Geld anlegen? Dann wird es so verteilt, dass dein Depot "
+                                    "näher an den Vorschlag rückt.")
+        nosell = o2.toggle("Nichts verkaufen, nur nachkaufen", key="nosell",
+                           help="Statt Gewinner zu verkaufen (kostet Steuern und Gebühren), wird nur das neue Geld "
+                                "gezielt in die Werte gesteckt, die laut Vorschlag zu klein sind. So nähert sich dein "
+                                "Depot dem Ziel langsamer, aber steuerschonend.")
+        taxr = o3.number_input("Steuersatz auf Gewinne %", min_value=0.0, max_value=60.0, step=0.1, key="tax",
+                               help="Für die Schätzung der Steuer bei Verkäufen. Deutschland: ca. 26,4 % "
+                                    "(Abgeltungsteuer + Soli, ggf. + Kirchensteuer), Österreich 27,5 %, Italien 26 %. "
+                                    "Freibeträge und Verlusttöpfe werden nicht berücksichtigt.") / 100
+        if nosell and newm <= 0:
+            st.caption("Für „nur nachkaufen“ trag links ein, wie viel neues Geld du investieren willst.")
+    cur_v = cur * V
+    d_eur = plan(cur_v, tw, newm, nosell)
+    after = cur_v + d_eur
+    thr = 0.005 * max(V + newm, 1)
+    moves = [(names[i], d_eur[i]) for i in range(len(assets)) if abs(d_eur[i]) >= thr]
     if not moves:
         st.success("Dein Portfolio ist für dieses Ziel schon gut aufgeteilt. Du musst nichts ändern.")
     else:
         buy = [f"**{n}** (+{eur(x)})" for n, x in moves if x > 0]
         sell = [f"**{n}** (−{eur(-x)})" for n, x in moves if x < 0]
-        st.info("**Vorschlag:** " + ("Mehr kaufen: " + ", ".join(buy) + ". " if buy else "") +
-                ("Weniger halten: " + ", ".join(sell) + "." if sell else ""))
+        st.info("**Vorschlag:** " + ("Kaufen: " + ", ".join(buy) + ". " if buy else "") +
+                ("Verkaufen: " + ", ".join(sell) + "." if sell else ""))
+    realized = np.zeros(len(assets))
+    if dep is not None:
+        for i, t in enumerate(assets):
+            g, v = dep.loc[t, "gain"], dep.loc[t, "value"]
+            if d_eur[i] < -thr and g is not None and v > 0:
+                realized[i] = min(1.0, -d_eur[i] / v) * g
+    tax_total = max(0.0, realized.sum()) * taxr
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Ø Gewinn pro Jahr", pc(tm["Rendite p.a."]), f"{sg((tm['Rendite p.a.'] - cm['Rendite p.a.']) * 100)} Prozentpunkte",
@@ -615,18 +901,44 @@ def page_overview():
     left, right = st.columns([5, 6], gap="large")
     with left:
         st.subheader("Was du ändern müsstest",
-                     help=f"Beträge in Euro, bezogen auf dein Gesamtvermögen von {eur(V)}. Änderungen unter 0,5 % "
-                          "werden als „behalten“ gezeigt. Gebühren und Steuern sind nicht eingerechnet.")
-        act = [("behalten" if abs(x) < 0.005 else (f"+{eur(x * V)} kaufen" if x > 0 else f"−{eur(-x * V)} verkaufen"))
-               for x in d]
-        st.dataframe(pd.DataFrame({"Wertpapier": names, "Jetzt": [eur(x * V) for x in cur],
-                                   "Vorschlag": [eur(w * V) for w in tw], "Was tun?": act}),
-                     hide_index=True, width="stretch", height=min(600, 42 + 36 * len(assets)))
+                     help=f"Beträge in Euro, bezogen auf dein Depot von {eur(V)}" + (f" plus {eur(newm)} neues Geld"
+                          if newm else "") + ". Änderungen unter 0,5 % werden als „behalten“ gezeigt. Gebühren sind "
+                          "nicht eingerechnet." + (" Stückzahlen basieren auf dem aktuellen Kurs." if dep is not None else ""))
+        act = [("behalten" if abs(x) < thr else (f"+{eur(x)} kaufen" if x > 0 else f"−{eur(-x)} verkaufen"))
+               for x in d_eur]
+        tab = {"Wertpapier": names, "Jetzt": [eur(x) for x in cur_v], "Nachher": [eur(x) for x in after], "Was tun?": act}
+        TC = st.column_config.TextColumn
+        tcfg = {"Nachher": TC(help="Wert der Position, wenn du den Vorschlag umsetzt.")}
+        if dep is not None:
+            pe = [dep.loc[t, "price_eur"] for t in assets]
+            tab["Stück"] = [("–" if abs(x) < thr or not p_ else ("+" if x > 0 else "−") + de(abs(x) / p_, 2))
+                            for x, p_ in zip(d_eur, pe)]
+            tab["Gewinn realisiert"] = [(("+" if x > 0 else "−") + eur(abs(x))) if x else "–" for x in realized]
+            tab["Steuer ca."] = [eur(max(0, x) * taxr) if x > 0 else "–" for x in realized]
+            tcfg |= {"Stück": TC(help="Wie viele Anteile du kaufen (+) oder verkaufen (−) müsstest, zum aktuellen Kurs."),
+                     "Gewinn realisiert": TC(help="Der Teil deines Gewinns (oder Verlusts), den du durch den Verkauf "
+                                                  "„mitnimmst“. Nur realisierte Gewinne werden besteuert."),
+                     "Steuer ca.": TC(help="Geschätzte Steuer auf den realisierten Gewinn mit deinem Steuersatz – "
+                                           "ohne Freibetrag und ohne Verrechnung mit anderen Verlusten.")}
+        st.dataframe(pd.DataFrame(tab), hide_index=True, width="stretch", column_config=tcfg,
+                     height=min(600, 42 + 36 * len(assets)))
+        if dep is not None and (realized != 0).any():
+            s1, s2 = st.columns(2)
+            s1.metric("Gewinne, die du realisierst", ("+" if realized.sum() >= 0 else "−") + eur(abs(realized.sum())),
+                      help="Summe aller realisierten Gewinne und Verluste aus den Verkäufen. Verluste verringern die Steuer.")
+            s2.metric("Geschätzte Steuer", eur(tax_total), help="Steuersatz × realisierte Gewinne (nach Verrechnung "
+                                                                 "mit realisierten Verlusten), ohne Freibeträge.")
     with right:
-        st.subheader("Aufteilung jetzt und mit Vorschlag", help="Anteil jedes Wertpapiers an deinem Geld.")
+        st.subheader("Aufteilung jetzt und nachher", help="Anteil jedes Wertpapiers an deinem Geld. „Ziel“ ist die "
+                                                          "ideale Aufteilung; „Nachher“ das, was du mit dieser "
+                                                          "Umschichtung erreichst (bei „nur nachkaufen“ oft noch nicht "
+                                                          "ganz das Ziel).")
         fig = go.Figure()
         fig.add_bar(y=names, x=cur, orientation="h", name="Jetzt", marker_color="#b8c4e8")
-        fig.add_bar(y=names, x=tw, orientation="h", name="Vorschlag", marker_color="#1240e0")
+        fig.add_bar(y=names, x=after / max(after.sum(), 1e-9), orientation="h", name="Nachher", marker_color="#1240e0")
+        if nosell:
+            fig.add_scatter(y=names, x=tw, mode="markers", name="Ziel", marker=dict(symbol="line-ns-open", size=22,
+                                                                                    color="#e8361b", line=dict(width=3)))
         fig.update_layout(barmode="group", height=80 + 60 * len(assets), margin=dict(l=10, r=10, t=10, b=10),
                           xaxis_tickformat=".0%", legend=dict(orientation="h", y=1.08), yaxis_autorange="reversed",
                           font=dict(size=15))
@@ -670,6 +982,20 @@ def page_overview():
                    f"{pc(hi[cap_i[0]], 0)}. Ohne Grenze würde das Modell noch mehr hineinstecken – ein Zeichen, dass es "
                    "stark auf die gute Vergangenheit dieses Werts setzt. Genau davor schützt die Grenze.")
                   if cap_i and target == "Max-Sharpe" else ""]
+    if dep is not None and moves:
+        if tax_total > 1:
+            lines.append(f"**Steuern:** Die Umsetzung würde etwa **{eur(tax_total)}** Steuern kosten "
+                         f"({pc(tax_total / max(V, 1))} deines Depots). Dieser Betrag ist sofort weg – der Vorschlag muss "
+                         "ihn erst wieder einspielen. Mit **„Nichts verkaufen, nur nachkaufen“** vermeidest du das und "
+                         "näherst dich dem Ziel Schritt für Schritt mit neuem Geld.")
+        elif realized.sum() < -1:
+            lines.append(f"**Steuern:** Die Verkäufe würden insgesamt **Verluste von {eur(-realized.sum())}** realisieren. "
+                         "Die kannst du mit anderen Gewinnen verrechnen – das kann die Steuer an anderer Stelle senken.")
+    if nosell and newm > 0:
+        gap_left = np.abs(after / max(after.sum(), 1e-9) - tw).sum() / 2
+        lines.append(f"**Nur nachkaufen:** Mit {eur(newm)} neuem Geld kommst du dem Ziel näher; es bleibt noch eine "
+                     f"Abweichung von etwa {pc(gap_left, 0)} des Depots. Mit weiterem Geld (z. B. Sparplan) schließt sich "
+                     "die Lücke nach und nach.")
     explain(lines)
     st.subheader("Weiter zu den Simulationen")
     cols = st.columns(4)
@@ -1657,6 +1983,7 @@ def page_news():
 # Menü
 # =====================================================================
 P_INPUT = st.Page(page_input, title="Mein Portfolio", icon=":material/edit:", url_path="portfolio", default=True)
+P_DEPOT = st.Page(page_depot, title="Mein Depot", icon=":material/account_balance_wallet:", url_path="depot")
 P_OVER = st.Page(page_overview, title="Übersicht & Vorschlag", icon=":material/dashboard:", url_path="uebersicht")
 P_GROWTH = st.Page(page_growth, title="Wertentwicklung", icon=":material/show_chart:", url_path="wertentwicklung")
 P_ASSETS = st.Page(page_assets, title="Meine Wertpapiere", icon=":material/list_alt:", url_path="wertpapiere")
@@ -1671,7 +1998,7 @@ P_INFO = st.Page(page_info, title="Unternehmensdaten", icon=":material/apartment
 P_IMPROVE = st.Page(page_improve, title="Portfolio verbessern", icon=":material/lightbulb:", url_path="verbessern")
 P_NEWS = st.Page(page_news, title="Nachrichten", icon=":material/newspaper:", url_path="nachrichten")
 
-menu = {"Start": [P_INPUT, P_OVER],
+menu = {"Start": [P_INPUT, P_DEPOT, P_OVER],
         "Simulationen & Analysen": [P_GROWTH, P_ASSETS, P_RISK, P_FUTURE, P_CHECK],
         "Infos & Ideen": [P_IMPROVE, P_INFO, P_NEWS]}
 if expert:
