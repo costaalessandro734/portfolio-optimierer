@@ -3,6 +3,7 @@
 Start lokal:  streamlit run app.py
 """
 import io
+import json
 import re
 from datetime import date, timedelta
 
@@ -473,9 +474,50 @@ def head(title, intro, help_txt=None):
 
 
 # =====================================================================
+# Speichern & Laden
+# =====================================================================
+SAVE_KEYS = ("sel", "names", "amounts", "bounds", "input_mode", "goal", "years", "hor", "tax", "expert", "bench")
+
+
+def state_to_json():
+    data = {k: ss.get(k) for k in SAVE_KEYS if k in ss}
+    data["pos"] = {t: {"qty": v.get("qty"), "cost": v.get("cost"),
+                       "date": v["date"].isoformat() if v.get("date") else None} for t, v in ss.pos.items()}
+    data["bounds"] = {t: list(v) for t, v in ss.bounds.items()}
+    data["app"], data["version"], data["saved"] = "Portfolio-Check", 1, date.today().isoformat()
+    return json.dumps(data, ensure_ascii=False, indent=1)
+
+
+def apply_load():
+    f = ss.get("loadfile")
+    if f is None:
+        return
+    try:
+        data = json.loads(f.getvalue().decode("utf-8"))
+        if data.get("app") != "Portfolio-Check":
+            raise ValueError("Das ist keine gespeicherte Portfolio-Check-Datei.")
+        for k in ("sel", "names", "amounts", "input_mode", "tax", "expert", "bench", "years", "hor"):
+            if k in data and data[k] is not None:
+                ss[k] = data[k]
+        if data.get("goal") in GOALS:
+            ss.goal = data["goal"]
+        ss.bounds = {t: tuple(v) for t, v in (data.get("bounds") or {}).items()}
+        ss.pos = {t: {"qty": v.get("qty") or 0.0, "cost": v.get("cost") or 0.0,
+                      "date": date.fromisoformat(v["date"]) if v.get("date") else None}
+                  for t, v in (data.get("pos") or {}).items()}
+        ss.imp += 1
+        ss.load_msg = ("ok", f"Depot vom {data.get('saved', '?')} geladen: {len(ss.sel)} Wertpapiere.")
+    except Exception as e:
+        ss.load_msg = ("err", f"Datei konnte nicht geladen werden: {e}")
+
+
+# =====================================================================
 # Seitenleiste: Einstellungen (immer sichtbar)
 # =====================================================================
 sb = st.sidebar
+if "load_msg" in ss:
+    kind, msg = ss.pop("load_msg")
+    (sb.success if kind == "ok" else sb.error)(msg)
 expert = sb.toggle("Expertenmodus", key="expert",
                    help="Schaltet zusätzliche Seiten (Efficient Frontier, Style Analysis, Strategievergleich) und "
                         "Einstellungen frei, z. B. eigene Grenzen pro Wertpapier und einen Benchmark.")
@@ -2006,5 +2048,14 @@ if expert:
 menu["Hilfe"] = [P_HELP]
 pg = st.navigation(menu)
 pg.run()
+with st.sidebar.expander("Depot speichern & laden", icon=":material/save:"):
+    st.caption("Deine Eingaben werden nicht auf dem Server gespeichert. Sichere sie als Datei und lade sie beim "
+               "nächsten Besuch wieder hoch.")
+    st.download_button("Depot speichern", state_to_json(), file_name=f"mein-depot-{date.today().isoformat()}.json",
+                       mime="application/json", icon=":material/download:", on_click="ignore", width="stretch",
+                       help="Lädt eine kleine Datei mit deiner Auswahl, Stückzahlen, Kaufkursen und Einstellungen "
+                            "herunter. Sie bleibt nur bei dir.")
+    st.file_uploader("Gespeichertes Depot laden", type=["json"], key="loadfile", on_change=apply_load,
+                     help="Wähle die Datei, die du mit „Depot speichern“ heruntergeladen hast.")
 st.caption("Alle Zahlen beruhen auf vergangenen Kursen. Gebühren und Steuern sind nicht berücksichtigt. "
            "Keine Anlageberatung.")
