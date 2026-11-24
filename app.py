@@ -3,6 +3,7 @@
 Start lokal:  streamlit run app.py
 """
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
 import json
 import re
@@ -265,7 +266,7 @@ def _closes(df, tickers):
 
 
 def _yahoo_raw(ticker, start, end):
-    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    df = yf.download(ticker, start=start, end=end, interval="1mo", auto_adjust=True, progress=False)
     if df is None or df.empty:
         return None
     s = df["Close"]
@@ -294,33 +295,69 @@ def _load_raw(ticker, start, end):
     return None
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load(ticker, start, end):
-    return _load_raw(ticker, start, end)
+HIST_START = date(1999, 1, 1)
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
+@st.cache_resource
+def _store():
+    """Zwischenspeicher pro Wertpapier, für alle Nutzer gemeinsam. Bleibt bis zum Neustart der App erhalten."""
+    return {}
+
+
+def cached_many(kind, keys, fn, ttl, fail_ttl=3600):
+    """Holt nur, was noch fehlt oder abgelaufen ist – parallel – und merkt es sich je Schlüssel."""
+    box = _store().setdefault(kind, {})
+    now = time.time()
+    need = [k for k in dict.fromkeys(keys)
+            if k not in box or now - box[k][0] > (ttl if box[k][1] is not None else fail_ttl)]
+    for k, v in zip(need, pmap(fn, need)):
+        box[k] = (now, v)
+    return {k: box[k][1] for k in keys}
+
+
+def hist_missing(tickers):
+    box = _store().get("hist", {})
+    now = time.time()
+    return [t for t in tickers if t not in box or now - box[t][0] > (12 * 3600 if box[t][1] is not None else 3600)]
+
+
+def hist_many(tickers):
+    """Monatskurse ab 1999 – fehlende Wertpapiere in EINER Sammelabfrage, danach aus dem Speicher."""
+    box = _store().setdefault("hist", {})
+    need = hist_missing([t for t in dict.fromkeys(tickers) if t])
+    if need:
+        now, got = time.time(), {}
+        try:
+            df = yf.download(need, start=HIST_START, interval="1mo", auto_adjust=True, progress=False, threads=True)
+            c = _closes(df, need)
+            for t in need:
+                if t in c.columns:
+                    s = to_monthly(c[t])
+                    if len(s) >= 13:
+                        got[t] = s
+        except Exception:
+            pass
+        rest = [t for t in need if t not in got]
+        for t, s in zip(rest, pmap(lambda t: _load_raw(t, HIST_START, date.today()), rest)):
+            got[t] = s
+        for t in need:
+            box[t] = (now, got.get(t))
+    return {t: box[t][1] for t in tickers if t in box and box[t][1] is not None}
+
+
 def load_many(tickers, start, end):
-    """Kursverläufe vieler Ticker in EINER Yahoo-Abfrage; Fehlende parallel einzeln nachladen."""
-    tickers = [t for t in dict.fromkeys(tickers) if t]
+    """Kursverläufe für den gewünschten Zeitraum – aus dem Speicher ausgeschnitten."""
+    s0, e0 = pd.Period(start, "M"), pd.Period(end, "M")
     out = {}
-    if not tickers:
-        return out
-    try:
-        df = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False, threads=True)
-        c = _closes(df, tickers)
-        for t in tickers:
-            if t in c.columns:
-                s = to_monthly(c[t])
-                if len(s) >= 13:
-                    out[t] = s
-    except Exception:
-        pass
-    rest = [t for t in tickers if t not in out]
-    for t, s in zip(rest, pmap(lambda t: _load_raw(t, start, end), rest)):
-        if s is not None:
-            out[t] = s
+    for t, s in hist_many(tickers).items():
+        part = s[(s.index >= s0) & (s.index <= e0)]
+        if len(part) >= 13:
+            out[t] = part
     return out
+
+
+def load(ticker, start, end):
+    return load_many((ticker,), start, end).get(ticker)
 
 
 def parse_upload(file):
@@ -430,7 +467,6 @@ def guess_currency(t):
     return "USD" if u.replace("-", "").isalpha() else None                # US-Kürzel, z. B. AAPL, BRK-B
 
 
-@st.cache_data(ttl=30 * 24 * 3600, show_spinner=False)
 def currency_of(tickers):
     """Handelswährung je Ticker – aus dem Kürzel abgeleitet; nur Unbekannte werden (parallel) abgefragt."""
     def one(t):
@@ -447,26 +483,31 @@ def currency_of(tickers):
             return yf.Ticker(t).info.get("currency")
         except Exception:
             return None
-    res = pmap(one, tickers)
-    return {t: (c_ or ("EUR" if t.upper().endswith(EUR_SUFFIX) else "USD")) for t, c_ in zip(tickers, res)}
+    res = cached_many("cur", list(tickers), one, 30 * 24 * 3600)
+    return {t: (res[t] or ("EUR" if t.upper().endswith(EUR_SUFFIX) else "USD")) for t in tickers}
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def quotes_many(tickers):
-    """Letzter Kurs (nicht dividendenbereinigt) aller Ticker in EINER Abfrage, plus Währung und Wechselkurs."""
+    """Letzter Kurs (nicht dividendenbereinigt) – fehlende in EINER Abfrage, 15 Min. gemerkt; plus Währung, Wechselkurs."""
     tickers = [t for t in dict.fromkeys(tickers) if t]
-    prices = {}
-    if tickers:
+    box = _store().setdefault("quote", {})
+    now = time.time()
+    need = [t for t in tickers if t not in box or now - box[t][0] > 900]
+    if need:
+        got = {}
         try:
-            df = yf.download(tickers, period="5d", auto_adjust=False, progress=False, threads=True)
-            c = _closes(df, tickers)
-            for t in tickers:
+            df = yf.download(need, period="5d", auto_adjust=False, progress=False, threads=True)
+            c = _closes(df, need)
+            for t in need:
                 if t in c.columns:
                     s = pd.to_numeric(c[t], errors="coerce").dropna()
                     if len(s):
-                        prices[t] = float(s.iloc[-1])
+                        got[t] = float(s.iloc[-1])
         except Exception:
             pass
+        for t in need:
+            box[t] = (now, got.get(t))
+    prices = {t: box[t][1] for t in tickers if box[t][1] is not None}
     curs = currency_of(tuple(tickers))
     fxs = {cu: get_fx(cu) for cu in set(curs.values())}
     return {t: (prices.get(t), curs[t], fxs.get(curs[t])) for t in tickers}
@@ -768,8 +809,10 @@ if expert:
 # =====================================================================
 def get_ctx():
     tickers = list(dict.fromkeys(ss.sel))
-    with st.spinner("Lade Kurse …"):
-        series = dict(load_many(tuple(tickers + ([bench_t] if bench_t else [])), start, end))
+    allt = tuple(tickers + ([bench_t] if bench_t else []))
+    miss = hist_missing(list(allt))
+    with st.spinner(f"Lade Kursverläufe für {len(miss)} Wertpapiere (einmalig) …" if miss else "Lade Kurse …"):
+        series = dict(load_many(allt, start, end))
     failed = [t for t in tickers + ([bench_t] if bench_t else []) if t not in series]
     bench = bench_t if bench_t in series else None
     for f in uploads or []:
@@ -1742,14 +1785,12 @@ def _info_raw(t):
     return {k: info.get(k) for k in INFO_KEYS}
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def get_info(t):
-    return _info_raw(t)
+    return infos_many([t])[t]
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def infos_many(tickers):
-    return dict(zip(tickers, pmap(_info_raw, tickers)))
+    return cached_many("info", list(tickers), _info_raw, 24 * 3600)
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
@@ -1795,14 +1836,13 @@ def _news_raw(t, n=10):
     return out
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def get_news(t, n=10):
-    return _news_raw(t, n)
+    return news_many([t], n)[t]
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def news_many(tickers, n):
-    return dict(zip(tickers, pmap(lambda t: _news_raw(t, n), tickers)))
+    res = cached_many("news", [(t, n) for t in tickers], lambda k: _news_raw(*k), 1800)
+    return {t: res[(t, n)] for t in tickers}
 
 
 def fmt_big(x, cur=""):
@@ -2752,9 +2792,8 @@ def _divs_raw(t):
     return s[s.index >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=372)]
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def divs_many(tickers):
-    return dict(zip(tickers, pmap(_divs_raw, tickers)))
+    return cached_many("divs", list(tickers), _divs_raw, 24 * 3600)
 
 
 MONTHS = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
@@ -3234,9 +3273,18 @@ def _openfigi(isins):
     return out
 
 
-@st.cache_data(ttl=30 * 24 * 3600, show_spinner=False)
 def isin_many(items):
-    """ISIN → Yahoo-Ticker: Krypto direkt, sonst OpenFIGI (Sammelabfrage), Rest per Yahoo-Suche (parallel)."""
+    """ISIN → Yahoo-Ticker, gemerkt für alle Nutzer; nur Unbekanntes wird nachgeschlagen."""
+    box = _store().setdefault("isin", {})
+    need = tuple(it for it in items if not box.get(it[0]))
+    if need:
+        for k, v in _isin_lookup(need).items():
+            box[k] = v
+    return {s_: box.get(s_, "") for s_, _, _ in items}
+
+
+def _isin_lookup(items):
+    """Krypto direkt, sonst OpenFIGI (Sammelabfrage), Rest per Yahoo-Suche (parallel)."""
     out = {}
     for sym, name, cls in items:
         if cls == "CRYPTO":
