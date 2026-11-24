@@ -347,7 +347,8 @@ def parse_upload(file):
 
 def _search_raw(q):
     try:
-        quotes = yf.Search(q, max_results=10, news_count=0, lists_count=0, recommended=0, raise_errors=False).quotes
+        quotes = yf.Search(q, max_results=10, news_count=0, lists_count=0, recommended=0, raise_errors=False,
+                           timeout=8).quotes
     except Exception:
         return []
     out = []
@@ -411,12 +412,31 @@ def import_list():
 EUR_SUFFIX = (".DE", ".F", ".PA", ".AS", ".MC", ".MI", ".BR", ".VI", ".HE", ".LS", ".IR")
 
 
+SUFFIX_CUR = {".DE": "EUR", ".F": "EUR", ".PA": "EUR", ".AS": "EUR", ".MI": "EUR", ".MC": "EUR", ".BR": "EUR",
+              ".VI": "EUR", ".HE": "EUR", ".LS": "EUR", ".IR": "EUR", ".MU": "EUR", ".SG": "EUR", ".DU": "EUR",
+              ".BE": "EUR", ".HM": "EUR", ".L": "GBp", ".SW": "CHF", ".HK": "HKD", ".AX": "AUD", ".TO": "CAD",
+              ".V": "CAD", ".CO": "DKK", ".ST": "SEK", ".OL": "NOK", ".T": "JPY", ".KL": "MYR", ".SI": "SGD"}
+
+
+def guess_currency(t):
+    """Währung aus dem Yahoo-Kürzel ableiten (ohne Internet). None = unbekannt."""
+    u = t.upper()
+    if u.startswith("^") or "=" in u:
+        return None
+    if "." in u:                                                       # Börsenendung, z. B. SAP.DE, NOVO-B.CO
+        return next((c_ for s_, c_ in SUFFIX_CUR.items() if u.endswith(s_.upper())), None)
+    if "-" in u and u.rsplit("-", 1)[1] in ("EUR", "USD", "GBP", "CHF"):  # Krypto, z. B. BTC-EUR
+        return u.rsplit("-", 1)[1]
+    return "USD" if u.replace("-", "").isalpha() else None                # US-Kürzel, z. B. AAPL, BRK-B
+
+
 @st.cache_data(ttl=30 * 24 * 3600, show_spinner=False)
 def currency_of(tickers):
-    """Handelswährung je Ticker – parallel abgefragt, 30 Tage gemerkt."""
+    """Handelswährung je Ticker – aus dem Kürzel abgeleitet; nur Unbekannte werden (parallel) abgefragt."""
     def one(t):
-        if t.upper().endswith("-EUR"):
-            return "EUR"
+        g_ = guess_currency(t)
+        if g_:
+            return g_
         try:
             c_ = yf.Ticker(t).fast_info["currency"]
             if c_:
@@ -659,7 +679,7 @@ def head(title, intro, help_txt=None, tag="Portfolio-Check"):
 # =====================================================================
 # Speichern & Laden
 # =====================================================================
-SAVE_KEYS = ("sel", "names", "amounts", "bounds", "input_mode", "goal", "years", "hor", "tax", "expert", "bench",
+SAVE_KEYS = ("sel", "names", "amounts", "bounds", "input_mode", "goal", "years", "hor", "tax", "expert", "bench", "tr_map",
              "newmoney", "nosell", "sp_start", "sp_rate", "sp_years", "sp_goal", "sp_dyn", "sp_infl", "wd_start", "wd_rate", "wd_years", "wd_infl", "bm_choice")
 
 
@@ -680,7 +700,7 @@ def apply_load():
         data = json.loads(f.getvalue().decode("utf-8"))
         if data.get("app") != "Portfolio-Check":
             raise ValueError("Das ist keine gespeicherte Portfolio-Check-Datei.")
-        for k in ("sel", "names", "amounts", "input_mode", "tax", "expert", "bench", "years", "hor",
+        for k in ("sel", "names", "amounts", "input_mode", "tax", "expert", "bench", "years", "hor", "tr_map",
                   "newmoney", "nosell", "sp_start", "sp_rate", "sp_years", "sp_goal", "sp_dyn", "sp_infl", "wd_start", "wd_rate", "wd_years", "wd_infl", "bm_choice"):
             if k in data and data[k] is not None:
                 ss[k] = data[k]
@@ -829,6 +849,9 @@ def ready():
 # SEITEN
 # =====================================================================
 def page_input():
+    if ss.pop("do_take", False) and ss.get("tr"):
+        tr_take_over_run()
+        st.rerun()
     head("Mein Portfolio", "Trag ein, welche Aktien oder ETFs du hast und wie viel Geld jeweils darin steckt. "
                            "Danach findest du links im Menü alle Auswertungen und Simulationen.")
     st.header("1. Welche Wertpapiere hast du?")
@@ -857,9 +880,9 @@ def page_input():
             st.success(f"**{msg[1]} Positionen übernommen.** Stückzahlen, Kaufkurse und Kaufdaten stehen unten in Schritt 2. "
                        "Alle Seiten im Menü rechnen jetzt mit deinem Trade-Republic-Depot.")
             if msg[2]:
-                st.warning("Ohne aktuellen Kurs, deshalb nicht übernommen: " + ", ".join(msg[2]) + ". Den Yahoo-Ticker "
-                           "kannst du auf der Seite **Trade-Republic-Import** im Reiter „Zuordnung der Kurse“ eintragen "
-                           "und dann erneut übernehmen.")
+                st.warning("Kein Börsenkürzel gefunden, deshalb nicht übernommen: " + ", ".join(msg[2]) + ". Den "
+                           "Yahoo-Ticker kannst du auf der Seite **Trade-Republic-Import** im Reiter „Zuordnung der Kurse“ "
+                           "eintragen und dann erneut übernehmen.")
             if msg[3]:
                 st.caption("Krypto nicht übernommen: " + ", ".join(msg[3]))
         elif msg and msg[0] == "err":
@@ -3166,16 +3189,67 @@ def tr_load():
         ss.tr, ss.tr_err = None, str(e)
 
 
+FIGI_SUFFIX = {"US": "", "UN": "", "UW": "", "UQ": "", "UR": "", "UA": "", "GY": ".DE", "GR": ".DE", "GF": ".F",
+               "GM": ".MU", "GS": ".SG", "LN": ".L", "NA": ".AS", "FP": ".PA", "IM": ".MI", "SM": ".MC", "SW": ".SW",
+               "SE": ".SW", "HK": ".HK", "AU": ".AX", "AT": ".AX", "CT": ".TO", "CN": ".TO", "DC": ".CO", "SS": ".ST",
+               "NO": ".OL", "FH": ".HE", "BB": ".BR", "ID": ".IR", "JT": ".T", "JP": ".T", "MK": ".KL", "SP": ".SI"}
+FIGI_ORDER = ["US", "UN", "UW", "UQ", "GY", "GR", "LN", "NA", "FP", "IM", "SM", "SW", "SE", "HK", "AU", "AT", "CT",
+              "CN", "DC", "SS", "NO", "FH", "BB", "ID", "JT", "JP", "MK", "SP", "GF", "GM", "GS"]
+
+
+def _figi_to_yahoo(rec):
+    ex, tk = rec.get("exchCode"), (rec.get("ticker") or "").strip()
+    if not tk or ex not in FIGI_SUFFIX:
+        return None
+    tk = tk.replace("/", "-").replace(" ", "-")
+    if ex == "HK" and tk.isdigit():
+        tk = tk.zfill(4)
+    return tk + FIGI_SUFFIX[ex]
+
+
+def _openfigi(isins):
+    """Viele ISINs auf einmal über OpenFIGI zuordnen (kostenlos, 10 je Anfrage)."""
+    import requests
+    out = {}
+    chunks = [isins[i:i + 10] for i in range(0, len(isins), 10)]
+
+    def ask(chunk):
+        try:
+            rsp = requests.post("https://api.openfigi.com/v3/mapping", timeout=10,
+                                json=[{"idType": "ID_ISIN", "idValue": x} for x in chunk])
+            return chunk, (rsp.json() if rsp.status_code == 200 else [])
+        except Exception:
+            return chunk, []
+    for chunk, res in pmap(ask, chunks, workers=4):
+        for isin, item in zip(chunk, res or []):
+            recs = item.get("data") or [] if isinstance(item, dict) else []
+            recs = sorted(recs, key=lambda r_: FIGI_ORDER.index(r_.get("exchCode")) if r_.get("exchCode") in FIGI_ORDER else 99)
+            for rec in recs:
+                y_ = _figi_to_yahoo(rec)
+                if y_:
+                    out[isin] = y_
+                    break
+    return out
+
+
 @st.cache_data(ttl=30 * 24 * 3600, show_spinner=False)
 def isin_many(items):
-    """ISIN → Yahoo-Ticker für viele Positionen parallel."""
-    def one(it):
-        sym, name, cls = it
+    """ISIN → Yahoo-Ticker: Krypto direkt, sonst OpenFIGI (Sammelabfrage), Rest per Yahoo-Suche (parallel)."""
+    out = {}
+    for sym, name, cls in items:
         if cls == "CRYPTO":
-            return f"{sym}-EUR"
-        res = _search_raw(sym) or _search_raw(name)
+            out[sym] = f"{sym}-EUR"
+    isins = [s_ for s_, _, c_ in items if c_ != "CRYPTO"]
+    if isins:
+        out.update(_openfigi(isins))
+    rest = [(s_, n_) for s_, n_, c_ in items if s_ not in out]
+
+    def yahoo(it):
+        res = _search_raw(it[0]) or _search_raw(it[1])
         return res[0]["sym"] if res else ""
-    return dict(zip([i[0] for i in items], pmap(one, items)))
+    for (s_, _), tk in zip(rest, pmap(yahoo, rest)):
+        out[s_] = tk
+    return out
 
 
 def tr_valuation(tr):
@@ -3199,25 +3273,54 @@ def tr_valuation(tr):
 
 
 def tr_take_over(from_upload=False):
-    """Callback: (optional Datei einlesen,) Kurse suchen und das Depot in „Mein Portfolio“ übernehmen."""
+    """Callback: Datei einlesen (ohne Internet) und die Übernahme beauftragen."""
     if from_upload:
         f = ss.get("tr_file_input")
         if f is None:
             return
         try:
             ss.tr = analyse_tr(read_tr_csv(f.getvalue()))
-            ss.tr_err, ss.tr_map = None, {}
+            ss.tr_err = None
         except Exception as e:
             ss.tr, ss.tr_err = None, str(e)
             ss.take_msg = ("err", str(e))
             return
-    if not ss.get("tr"):
-        return
-    v = tr_valuation(ss.tr)
-    tr_apply(v, ss.get("tr_crypto_in", True))
-    miss = v[v["price"].isna()]["name"].tolist()
-    skipped = v[v["krypto"]]["name"].tolist() if not ss.get("tr_crypto_in", True) else []
-    ss.take_msg = ("ok", ss.tr_applied, miss, skipped)
+    if ss.get("tr"):
+        ss.do_take = True
+
+
+def tr_take_over_run():
+    """Übernahme mit Fortschrittsanzeige: Stück/Kaufkurs/Datum kommen aus der CSV, nur die Ticker werden gesucht."""
+    tr, with_c = ss.tr, ss.get("tr_crypto_in", True)
+    hold = tr["hold"]
+    use = hold if with_c else hold[hold["cls"] != "CRYPTO"]
+    with st.status("Übernehme dein Trade-Republic-Depot …", expanded=True) as stt:
+        st.write(f":material/check: {len(use)} Positionen mit Stückzahl, Ø Kaufkurs und Kaufdatum aus der CSV gelesen")
+        todo = tuple((r_["symbol"], r_["name"], r_["cls"]) for _, r_ in use.iterrows() if not ss.tr_map.get(r_["symbol"]))
+        if todo:
+            st.write(f":material/search: Ordne {len(todo)} ISINs ihren Börsenkürzeln zu …")
+            ss.tr_map.update({k: v for k, v in isin_many(todo).items()})
+        found = [s_ for s_ in use["symbol"] if ss.tr_map.get(s_)]
+        st.write(f":material/check: {len(found)} von {len(use)} zugeordnet")
+        groups = {}
+        for _, r_ in use.iterrows():
+            tk = ss.tr_map.get(r_["symbol"])
+            if tk:
+                groups.setdefault(tk, []).append(r_)
+        ss.sel = list(groups)
+        for tk, rows in groups.items():
+            qty = float(sum(x["qty"] for x in rows))
+            cost = float(sum(x["cost"] for x in rows))
+            first = min((x["first"] for x in rows if pd.notna(x["first"])), default=None)
+            ss.names[tk] = rows[0]["name"]
+            ss.pos[tk] = {"qty": qty, "cost": cost / qty if qty else 0.0, "date": first.date() if first is not None else None}
+        ss.input_mode = "Genau: Stückzahl & Kaufkurs"
+        ss.imp += 1
+        ss.tr_applied = len(groups)
+        stt.update(label="Depot übernommen – aktuelle Kurse werden jetzt geladen", state="complete", expanded=False)
+    miss = [r_["name"] for _, r_ in use.iterrows() if not ss.tr_map.get(r_["symbol"])]
+    skipped = hold[hold["cls"] == "CRYPTO"]["name"].tolist() if not with_c else []
+    ss.take_msg = ("ok", len(groups), miss, skipped)
 
 
 def tr_apply(v, with_crypto):
@@ -3439,7 +3542,9 @@ def page_tr():
                      help="Krypto schwankt sehr stark. Aus: Nur Wertpapiere werden analysiert; Krypto bleibt hier "
                           "in der Vermögensübersicht sichtbar.")
     if st.button("Depot übernehmen", type="primary", icon=":material/move_down:"):
-        tr_apply(v, wc)
+        ss.tr_crypto_in = wc
+        ss.do_take = True
+        st.switch_page(P_INPUT)
     if ss.get("tr_applied"):
         st.success(f"{ss.tr_applied} Positionen übernommen. Schau dir jetzt **Mein Depot** und **Übersicht & "
                    "Vorschlag** an. Tipp: Mit „Depot speichern“ (Seitenleiste) sicherst du den Stand.")
