@@ -5,3 +5,5 @@ numpy
 scipy
 plotly
 lxml
+fpdf2>=2.7
+matplotlib
