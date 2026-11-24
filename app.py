@@ -3,6 +3,7 @@
 Start lokal:  streamlit run app.py
 """
 import io
+from concurrent.futures import ThreadPoolExecutor
 import json
 import re
 from datetime import date, timedelta
@@ -17,20 +18,81 @@ from scipy.optimize import minimize
 st.set_page_config(page_title="Portfolio-Check", layout="wide", initial_sidebar_state="expanded")
 
 # =====================================================================
-# Größeres Interface
+# Design: Royalblau (Hauptfarbe) + Türkis (Nebenfarbe)
 # =====================================================================
+PRI, PRI_D, PRI_L, PRI_A = "#2563EB", "#1E3A8A", "#BFD3FB", "rgba(37,99,235,0.15)"
+SEC, SEC_A = "#0FB5BA", "rgba(15,181,186,0.18)"
+GAIN, LOSS, GREY = "#16A34A", "#DC2626", "#94A3B8"
+
+import plotly.io as pio
+pio.templates["portfolio"] = go.layout.Template(layout=dict(
+    font=dict(family="Inter, system-ui, sans-serif"),
+    colorway=[PRI, SEC, "#6366F1", "#F59E0B", "#EC4899", "#10B981", "#8B5CF6", "#0EA5E9", "#F97316", GREY],
+    hoverlabel=dict(font=dict(family="Inter, system-ui, sans-serif")),
+    bargap=0.25, legend=dict(font=dict(size=13))))
+pio.templates.default = "plotly+portfolio"
+
 st.markdown("""
 <style>
-html { font-size: 18px; }
-.block-container { max-width: 1500px; padding-top: 2.2rem; padding-bottom: 4rem; }
-h1 { font-size: 2.6rem !important; }
-h2 { font-size: 1.9rem !important; }
-h3 { font-size: 1.45rem !important; }
-[data-testid="stMetricValue"] { font-size: 2.3rem; }
-[data-testid="stMetricLabel"] p { font-size: 1.05rem; }
-[data-testid="stSidebarNav"] a span, [data-testid="stSidebarNavLink"] span { font-size: 1.05rem; }
-button[data-baseweb="tab"] p { font-size: 1.1rem; }
-.intro { font-size: 1.15rem; opacity: .85; max-width: 70ch; margin-bottom: 1.2rem; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+html { font-size: 17.5px; }
+html, body, p, li, label, input, textarea, button, .stMarkdown, [data-testid="stMetric"] {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+.block-container { max-width: 1480px; padding-top: 1.4rem; padding-bottom: 4rem; }
+h1, h2, h3 { font-family: 'Inter', system-ui, sans-serif; letter-spacing: -0.015em; font-weight: 700 !important; }
+h2 { font-size: 1.7rem !important; margin-top: 1.4rem !important; }
+h3 { font-size: 1.3rem !important; }
+
+/* Kopfbereich jeder Seite */
+.hero { background: linear-gradient(120deg, #1E3A8A 0%, #2563EB 55%, #0FB5BA 100%); color: #fff;
+  border-radius: 22px; padding: 1.7rem 2.1rem 1.6rem; margin: 0 0 1.1rem;
+  box-shadow: 0 18px 40px -22px rgba(37,99,235,.75); position: relative; overflow: hidden; }
+.hero::after { content: ""; position: absolute; right: -60px; top: -60px; width: 260px; height: 260px;
+  border-radius: 50%; background: rgba(255,255,255,.10); }
+.hero h1 { color: #fff !important; font-size: 2.35rem !important; margin: 0 0 .4rem !important; padding: 0 !important; }
+.hero p { color: rgba(255,255,255,.93); font-size: 1.1rem; max-width: 78ch; margin: 0; line-height: 1.55; }
+.hero .tag { display: inline-block; font-size: .78rem; font-weight: 600; letter-spacing: .02em;
+  background: rgba(255,255,255,.18); padding: .2rem .65rem; border-radius: 999px; margin-bottom: .7rem; }
+
+/* Kennzahlen als Karten */
+[data-testid="stMetric"] { background: rgba(37,99,235,.055); border: 1px solid rgba(37,99,235,.16);
+  border-radius: 16px; padding: .85rem 1.05rem; transition: box-shadow .2s; }
+[data-testid="stMetric"]:hover { box-shadow: 0 8px 22px -14px rgba(37,99,235,.6); }
+[data-testid="stMetricValue"] { font-size: 1.95rem; font-weight: 700; }
+[data-testid="stMetricLabel"] p { font-size: .95rem; font-weight: 500; opacity: .8; }
+
+/* Kästen, Tabellen, Links */
+[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 18px !important; }
+[data-testid="stDataFrame"], [data-testid="stDataEditor"] { border-radius: 14px; overflow: hidden;
+  border: 1px solid rgba(37,99,235,.14); }
+[data-testid="stPageLink"] a { border-radius: 12px; border: 1px solid rgba(37,99,235,.18); padding: .35rem .7rem; }
+[data-testid="stPageLink"] a:hover { background: rgba(37,99,235,.08); }
+
+/* „Was bedeutet das?“ */
+[class*="st-key-explain"] { background: linear-gradient(135deg, rgba(15,181,186,.13), rgba(37,99,235,.06));
+  border-left: 6px solid #0FB5BA; border-radius: 16px; padding: 1.05rem 1.3rem .4rem; margin: .6rem 0 1rem; }
+
+/* Buttons */
+.stButton > button, .stDownloadButton > button { border-radius: 12px; font-weight: 600; }
+.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
+  background: linear-gradient(120deg, #2563EB, #0FB5BA); border: 0; color: #fff;
+  box-shadow: 0 8px 20px -12px rgba(37,99,235,.9); }
+.stButton > button[kind="primary"]:hover { filter: brightness(1.06); }
+
+/* Reiter */
+button[data-baseweb="tab"] p { font-size: 1.05rem; font-weight: 600; }
+.stTabs [data-baseweb="tab-highlight"] { background: linear-gradient(90deg, #2563EB, #0FB5BA); height: 3px; }
+
+/* Seitenleiste */
+[data-testid="stSidebar"] { min-width: 320px !important; }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, rgba(37,99,235,.09) 0%, rgba(15,181,186,.07) 100%);
+  border-right: 1px solid rgba(37,99,235,.12); }
+[data-testid="stSidebarNav"] a span, [data-testid="stSidebarNavLink"] span { font-size: 1.02rem; }
+[data-testid="stSidebarNavLink"] { border-radius: 10px; }
+[data-testid="stSidebarNavSeparator"] { border-color: rgba(37,99,235,.18); }
+
+/* Hinweis-, Erfolgs- und Warnboxen weicher */
+[data-testid="stAlert"] { border-radius: 14px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -153,8 +215,33 @@ def to_monthly(s):
     return s.groupby(s.index.to_period("M")).last()
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load_yahoo(ticker, start, end):
+def pmap(fn, items, workers=12):
+    """Mehrere Netzwerk-Abfragen gleichzeitig statt nacheinander."""
+    items = list(items)
+    if not items:
+        return []
+    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+        return list(ex.map(fn, items))
+
+
+def _closes(df, tickers):
+    """Schlusskurse aus yf.download – egal ob ein oder mehrere Ticker, alte oder neue Spaltenform."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        lv0 = set(df.columns.get_level_values(0))
+        if "Close" in lv0:
+            c = df["Close"]
+        else:
+            c = pd.DataFrame({t: df[t]["Close"] for t in tickers if t in lv0 and "Close" in df[t]})
+    else:
+        c = df[["Close"]].rename(columns={"Close": tickers[0]}) if "Close" in df.columns else pd.DataFrame()
+    if isinstance(c, pd.Series):
+        c = c.to_frame(tickers[0])
+    return c
+
+
+def _yahoo_raw(ticker, start, end):
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
     if df is None or df.empty:
         return None
@@ -164,8 +251,7 @@ def load_yahoo(ticker, start, end):
     return to_monthly(s)
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load_stooq(ticker, start, end):
+def _stooq_raw(ticker, start, end):
     df = pd.read_csv(f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d")
     if "Close" not in df.columns:
         return None
@@ -174,8 +260,8 @@ def load_stooq(ticker, start, end):
     return to_monthly(s) if len(s) else None
 
 
-def load(ticker, start, end):
-    for fn in (load_yahoo, load_stooq):
+def _load_raw(ticker, start, end):
+    for fn in (_yahoo_raw, _stooq_raw):
         try:
             s = fn(ticker, start, end)
             if s is not None and len(s) >= 13:
@@ -183,6 +269,35 @@ def load(ticker, start, end):
         except Exception:
             pass
     return None
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def load(ticker, start, end):
+    return _load_raw(ticker, start, end)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def load_many(tickers, start, end):
+    """Kursverläufe vieler Ticker in EINER Yahoo-Abfrage; Fehlende parallel einzeln nachladen."""
+    tickers = [t for t in dict.fromkeys(tickers) if t]
+    out = {}
+    if not tickers:
+        return out
+    try:
+        df = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False, threads=True)
+        c = _closes(df, tickers)
+        for t in tickers:
+            if t in c.columns:
+                s = to_monthly(c[t])
+                if len(s) >= 13:
+                    out[t] = s
+    except Exception:
+        pass
+    rest = [t for t in tickers if t not in out]
+    for t, s in zip(rest, pmap(lambda t: _load_raw(t, start, end), rest)):
+        if s is not None:
+            out[t] = s
+    return out
 
 
 def parse_upload(file):
@@ -207,8 +322,7 @@ def parse_upload(file):
     return to_monthly(s[s.index.notna()])
 
 
-@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
-def search(q):
+def _search_raw(q):
     try:
         quotes = yf.Search(q, max_results=10, news_count=0, lists_count=0, recommended=0, raise_errors=False).quotes
     except Exception:
@@ -219,6 +333,11 @@ def search(q):
             out.append({"sym": x["symbol"], "name": x.get("shortname") or x.get("longname") or x["symbol"],
                         "ex": x.get("exchDisp") or x.get("exchange", ""), "typ": x.get("typeDisp") or x.get("quoteType", "")})
     return out
+
+
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def search(q):
+    return _search_raw(q)
 
 
 def add_ticker(sym, name):
@@ -269,24 +388,50 @@ def import_list():
 EUR_SUFFIX = (".DE", ".F", ".PA", ".AS", ".MC", ".MI", ".BR", ".VI", ".HE", ".LS", ".IR")
 
 
+@st.cache_data(ttl=30 * 24 * 3600, show_spinner=False)
+def currency_of(tickers):
+    """Handelswährung je Ticker – parallel abgefragt, 30 Tage gemerkt."""
+    def one(t):
+        if t.upper().endswith("-EUR"):
+            return "EUR"
+        try:
+            c_ = yf.Ticker(t).fast_info["currency"]
+            if c_:
+                return c_
+        except Exception:
+            pass
+        try:
+            return yf.Ticker(t).info.get("currency")
+        except Exception:
+            return None
+    res = pmap(one, tickers)
+    return {t: (c_ or ("EUR" if t.upper().endswith(EUR_SUFFIX) else "USD")) for t, c_ in zip(tickers, res)}
+
+
 @st.cache_data(ttl=900, show_spinner=False)
+def quotes_many(tickers):
+    """Letzter Kurs (nicht dividendenbereinigt) aller Ticker in EINER Abfrage, plus Währung und Wechselkurs."""
+    tickers = [t for t in dict.fromkeys(tickers) if t]
+    prices = {}
+    if tickers:
+        try:
+            df = yf.download(tickers, period="5d", auto_adjust=False, progress=False, threads=True)
+            c = _closes(df, tickers)
+            for t in tickers:
+                if t in c.columns:
+                    s = pd.to_numeric(c[t], errors="coerce").dropna()
+                    if len(s):
+                        prices[t] = float(s.iloc[-1])
+        except Exception:
+            pass
+    curs = currency_of(tuple(tickers))
+    fxs = {cu: get_fx(cu) for cu in set(curs.values())}
+    return {t: (prices.get(t), curs[t], fxs.get(curs[t])) for t in tickers}
+
+
 def get_quote(t):
-    """Letzter Kurs (nicht dividendenbereinigt) und Währung."""
-    price = None
-    try:
-        df = yf.download(t, period="5d", auto_adjust=False, progress=False)
-        s = df["Close"]
-        if isinstance(s, pd.DataFrame):
-            s = s.iloc[:, 0]
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        price = float(s.iloc[-1]) if len(s) else None
-    except Exception:
-        pass
-    try:
-        cur_ = yf.Ticker(t).info.get("currency")
-    except Exception:
-        cur_ = None
-    return price, cur_ or ("EUR" if t.upper().endswith(EUR_SUFFIX) else "USD")
+    p_, c_, _ = quotes_many((t,))[t]
+    return p_, c_
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -311,11 +456,11 @@ def get_fx(cur_):
 def depot(assets):
     """Tabelle mit Stück, Kaufkurs, aktuellem Wert und Gewinn/Verlust je Position (alles in €)."""
     rows = []
+    qq = quotes_many(tuple(assets))
     for t in assets:
         p_ = ss.pos.get(t, {})
         qty, cost, dt = float(p_.get("qty") or 0), float(p_.get("cost") or 0), p_.get("date")
-        price, cur_ = get_quote(t)
-        fx = get_fx(cur_)
+        price, cur_, fx = qq[t]
         pe = price * fx if price is not None and fx is not None else None
         value = qty * pe if pe is not None else 0.0
         inv = qty * cost
@@ -444,9 +589,12 @@ def style_roll(R, y, lo, hi, win):
 # =====================================================================
 # Interpretation in Alltagssprache
 # =====================================================================
+_EXPL = iter(range(10 ** 6))
+
+
 def explain(lines):
-    with st.container(border=True):
-        st.markdown("**Was bedeutet das?**\n\n" + "\n\n".join(l for l in lines if l))
+    with st.container(key=f"explain_{next(_EXPL)}"):
+        st.markdown("**:material/lightbulb: Was bedeutet das?**\n\n" + "\n\n".join(l for l in lines if l))
 
 
 def lvl_vol(v):
@@ -477,9 +625,12 @@ def reasons(i, up, mu, S, C, target):
     return ("Grund: " + "; ".join(hits)) if hits else "Grund: passt rechnerisch besser in die Mischung"
 
 
-def head(title, intro, help_txt=None):
-    st.title(title, help=help_txt)
-    st.markdown(f"<p class='intro'>{intro}</p>", unsafe_allow_html=True)
+def head(title, intro, help_txt=None, tag="Portfolio-Check"):
+    st.markdown(f"<div class='hero'><span class='tag'>{tag}</span><h1>{title}</h1><p>{intro}</p></div>",
+                unsafe_allow_html=True)
+    if help_txt:
+        with st.popover("So wird gerechnet", icon=":material/info:"):
+            st.markdown(help_txt)
 
 
 # =====================================================================
@@ -572,14 +723,9 @@ if expert:
 # =====================================================================
 def get_ctx():
     tickers = list(dict.fromkeys(ss.sel))
-    series, failed = {}, []
     with st.spinner("Lade Kurse …"):
-        for t in tickers + ([bench_t] if bench_t else []):
-            s = load(t, start, end)
-            if s is None:
-                failed.append(t)
-            else:
-                series[t] = s
+        series = dict(load_many(tuple(tickers + ([bench_t] if bench_t else [])), start, end))
+    failed = [t for t in tickers + ([bench_t] if bench_t else []) if t not in series]
     bench = bench_t if bench_t in series else None
     for f in uploads or []:
         name = f.name.rsplit(".", 1)[0]
@@ -901,7 +1047,7 @@ def page_depot():
         st.subheader("Gewinn und Verlust je Position", help="Grün = im Plus, Rot = im Minus seit Kauf.")
         kk = known.sort_values("gain")
         fg = go.Figure(go.Bar(y=[label(t) for t in kk.index], x=kk["gain"], orientation="h",
-                              marker_color=["#0b7a3b" if x >= 0 else "#e8361b" for x in kk["gain"]],
+                              marker_color=[GAIN if x >= 0 else LOSS for x in kk["gain"]],
                               text=[("+" if x >= 0 else "−") + eur(abs(x)) for x in kk["gain"]], textposition="outside"))
         fg.update_layout(height=80 + 50 * len(kk), margin=dict(l=10, r=40, t=10, b=10), xaxis_title="€",
                          separators=",.", font=dict(size=15))
@@ -910,7 +1056,7 @@ def page_depot():
                                                     "in Prozent seit Kauf.")
     gp = [float(x * 100) if x is not None and x == x else 0.0 for x in dep["gain_pct"]]
     tm = go.Figure(go.Treemap(labels=names, parents=[""] * len(names), values=dep["value"].values,
-                              marker=dict(colors=gp, colorscale=[[0, "#e8361b"], [0.5, "#f1f1f1"], [1, "#0b7a3b"]],
+                              marker=dict(colors=gp, colorscale=[[0, LOSS], [0.5, "#F1F5F9"], [1, GAIN]],
                                           cmid=0, showscale=True, colorbar=dict(title="% seit Kauf")),
                               texttemplate="<b>%{label}</b><br>%{value:,.0f} €", textfont=dict(size=16)))
     tm.update_layout(height=460, margin=dict(l=10, r=10, t=10, b=10), separators=",.")
@@ -999,7 +1145,7 @@ def page_overview():
     st.caption(f"Große Zahl = mit Vorschlag. Dein jetziges Portfolio: Ø {pc(cm['Rendite p.a.'])} pro Jahr, Schwankung "
                f"{pc(cm['Vol. p.a.'])}, schlimmster Absturz −{pc(cm['Max. Drawdown'])}. Historisch und in-sample.")
 
-    left, right = st.columns([5, 6], gap="large")
+    left, right = st.columns([7, 5], gap="large")
     with left:
         st.subheader("Was du ändern müsstest",
                      help=f"Beträge in Euro, bezogen auf dein Depot von {eur(V)}" + (f" plus {eur(newm)} neues Geld"
@@ -1035,11 +1181,11 @@ def page_overview():
                                                           "Umschichtung erreichst (bei „nur nachkaufen“ oft noch nicht "
                                                           "ganz das Ziel).")
         fig = go.Figure()
-        fig.add_bar(y=names, x=cur, orientation="h", name="Jetzt", marker_color="#b8c4e8")
-        fig.add_bar(y=names, x=after / max(after.sum(), 1e-9), orientation="h", name="Nachher", marker_color="#1240e0")
+        fig.add_bar(y=names, x=cur, orientation="h", name="Jetzt", marker_color=PRI_L)
+        fig.add_bar(y=names, x=after / max(after.sum(), 1e-9), orientation="h", name="Nachher", marker_color=PRI)
         if nosell:
             fig.add_scatter(y=names, x=tw, mode="markers", name="Ziel", marker=dict(symbol="line-ns-open", size=22,
-                                                                                    color="#e8361b", line=dict(width=3)))
+                                                                                    color=SEC, line=dict(width=3)))
         fig.update_layout(barmode="group", height=80 + 60 * len(assets), margin=dict(l=10, r=10, t=10, b=10),
                           xaxis_tickformat=".0%", legend=dict(orientation="h", y=1.08), yaxis_autorange="reversed",
                           font=dict(size=15))
@@ -1113,7 +1259,7 @@ def page_growth():
     c = ready()
     R, cur, tw, V = c["R"], c["cur"], c["tw"], c["V"]
     head("Wertentwicklung", f"So hätte sich dein Geld in den letzten {c['T']} Monaten entwickelt – mit deiner "
-                            "jetzigen Aufteilung (rot) und mit dem Vorschlag (blau).")
+                            "jetzigen Aufteilung (türkis) und mit dem Vorschlag (blau).")
     dates = R.index.to_timestamp()
     rp_c, rp_t = R.values @ cur, R.values @ tw
     vc, vt = V * np.cumprod(1 + rp_c), V * np.cumprod(1 + rp_t)
@@ -1124,8 +1270,8 @@ def page_growth():
                           "Aufteilung zurückgesetzt. Achtung: Der Vorschlag kennt diese Vergangenheit bereits und "
                           "sieht hier deshalb besonders gut aus – ehrlicher ist der Realitäts-Check.")
         f1 = go.Figure()
-        f1.add_scatter(x=dates, y=vc, name="Jetziges Portfolio", line=dict(color="#e8361b", width=3))
-        f1.add_scatter(x=dates, y=vt, name="Vorschlag", line=dict(color="#1240e0", width=3))
+        f1.add_scatter(x=dates, y=vc, name="Jetziges Portfolio", line=dict(color=SEC, width=3))
+        f1.add_scatter(x=dates, y=vt, name="Vorschlag", line=dict(color=PRI, width=3))
         f1.update_layout(height=520, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Wert in €", separators=",.",
                          legend=dict(orientation="h", y=1.08), hovermode="x unified", font=dict(size=15))
         st.plotly_chart(f1, width="stretch")
@@ -1143,7 +1289,7 @@ def page_growth():
                      help="Abstand zum bisherigen Höchststand. 0 % = gerade auf Rekordhoch, −20 % = 20 % unter dem "
                           "letzten Hoch. Je tiefer und länger die Täler, desto härter war es, durchzuhalten.")
         f2 = go.Figure()
-        for v, n, col in [(vc, "Jetziges Portfolio", "#e8361b"), (vt, "Vorschlag", "#1240e0")]:
+        for v, n, col in [(vc, "Jetziges Portfolio", SEC), (vt, "Vorschlag", PRI)]:
             f2.add_scatter(x=dates, y=v / np.maximum.accumulate(v) - 1, name=n, line=dict(color=col), fill="tozeroy",
                            opacity=0.5)
         f2.update_layout(height=460, margin=dict(l=10, r=10, t=10, b=10), yaxis_tickformat=".0%",
@@ -1167,8 +1313,8 @@ def page_growth():
         yc = pd.Series(rp_c, index=R.index).add(1).groupby(R.index.year).prod() - 1
         yt = pd.Series(rp_t, index=R.index).add(1).groupby(R.index.year).prod() - 1
         f3 = go.Figure()
-        f3.add_bar(x=yc.index.astype(str), y=yc.values, name="Jetziges Portfolio", marker_color="#e8361b")
-        f3.add_bar(x=yt.index.astype(str), y=yt.values, name="Vorschlag", marker_color="#1240e0")
+        f3.add_bar(x=yc.index.astype(str), y=yc.values, name="Jetziges Portfolio", marker_color=SEC)
+        f3.add_bar(x=yt.index.astype(str), y=yt.values, name="Vorschlag", marker_color=PRI)
         f3.update_layout(barmode="group", height=460, margin=dict(l=10, r=10, t=10, b=10), yaxis_tickformat=".0%",
                          legend=dict(orientation="h", y=1.08), font=dict(size=15))
         st.plotly_chart(f3, width="stretch")
@@ -1211,7 +1357,7 @@ def page_assets():
                       "links: viel Gewinn bei wenig Schwankung. Die Punktgröße zeigt deinen Anteil.")
     vol, mu = np.sqrt(np.diag(c["S"])), c["mu"]
     fg = go.Figure(go.Scatter(x=vol, y=mu, mode="markers+text", text=names, textposition="top center",
-                              marker=dict(size=14 + 60 * cur, color="#1240e0", opacity=0.75)))
+                              marker=dict(size=14 + 60 * cur, color=PRI, opacity=0.75)))
     fg.update_layout(height=520, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Schwankung pro Jahr",
                      yaxis_title="Ø Gewinn pro Jahr", xaxis_tickformat=".0%", yaxis_tickformat=".0%", font=dict(size=15))
     st.plotly_chart(fg, width="stretch")
@@ -1236,8 +1382,8 @@ def page_risk():
                           "wenn es stark schwankt und mit den anderen zusammen fällt (Risikobeitrag).")
         rc = cur * (S @ cur) / (cur @ S @ cur)
         f4 = go.Figure()
-        f4.add_bar(y=names, x=cur, orientation="h", name="Anteil am Geld", marker_color="#b8c4e8")
-        f4.add_bar(y=names, x=rc, orientation="h", name="Anteil am Risiko", marker_color="#e8361b")
+        f4.add_bar(y=names, x=cur, orientation="h", name="Anteil am Geld", marker_color=PRI_L)
+        f4.add_bar(y=names, x=rc, orientation="h", name="Anteil am Risiko", marker_color=SEC)
         f4.update_layout(barmode="group", height=80 + 60 * len(names), margin=dict(l=10, r=10, t=10, b=10),
                          xaxis_tickformat=".0%", legend=dict(orientation="h", y=1.08), yaxis_autorange="reversed",
                          font=dict(size=15))
@@ -1299,8 +1445,8 @@ def page_future():
                  help="Linie = mittlerer Fall. Fläche = Bereich, in dem 9 von 10 simulierten Zukünften landen.")
     xm = np.arange(1, hor * 12 + 1) / 12
     f6 = go.Figure()
-    for k, col, rgba, nm in [("Aktuell", "#e8361b", "rgba(232,54,27,0.15)", "Jetziges Portfolio"),
-                             (target, "#1240e0", "rgba(18,64,224,0.15)", "Vorschlag")]:
+    for k, col, rgba, nm in [("Aktuell", SEC, SEC_A, "Jetziges Portfolio"),
+                             (target, PRI, PRI_A, "Vorschlag")]:
         p5, p50, p95 = BANDS[k]
         f6.add_scatter(x=np.r_[xm, xm[::-1]], y=np.r_[p95, p5[::-1]], fill="toself", fillcolor=rgba,
                        line=dict(width=0), name=nm + " (9 von 10 Fällen)", hoverinfo="skip")
@@ -1357,7 +1503,7 @@ def page_check():
                  "Vergangenheit – sei vorsichtig damit.")
     st.subheader("Verlauf im Testzeitraum", help="Start = 100. Monatlich auf die jeweilige Aufteilung zurückgesetzt.")
     show = ["Aktuell", target] + (["Benchmark"] if "Benchmark" in CURVES else [])
-    colors = {"Aktuell": "#e8361b", target: "#1240e0", "Benchmark": "#888"}
+    colors = {"Aktuell": SEC, target: PRI, "Benchmark": "#888"}
     fb = go.Figure([go.Scatter(x=R.index[s_:].to_timestamp(), y=CURVES[k], line=dict(color=colors[k], width=3),
                                name={"Aktuell": "Jetziges Portfolio"}.get(k, "Vorschlag" if k == target else k))
                     for k in show])
@@ -1398,8 +1544,8 @@ def page_frontier():
     fg.add_scatter(x=F[:, 0], y=F[:, 1], mode="lines", name="Efficient Frontier", line=dict(color="black", width=3))
     fg.add_scatter(x=np.sqrt(np.diag(S)), y=mu, mode="markers+text", text=names, textposition="top center",
                    name="Einzelwerte", marker=dict(symbol="square-open", size=11, color="gray"))
-    for k, sym, col in [("Aktuell", "circle", "#e8361b"), ("Min-Varianz", "circle-open", "#1240e0"),
-                        ("Max-Sharpe", "diamond", "#1240e0")]:
+    for k, sym, col in [("Aktuell", "circle", SEC), ("Min-Varianz", "circle-open", PRI),
+                        ("Max-Sharpe", "diamond", PRI)]:
         w = W[k]
         fg.add_scatter(x=[np.sqrt(w @ S @ w)], y=[w @ mu], mode="markers", name=k,
                        marker=dict(symbol=sym, size=18, color=col, line=dict(width=2, color=col)))
@@ -1412,7 +1558,7 @@ def page_frontier():
            else F[-1, 1] - cr if cv > F[-1, 0] else 0)
     mv_ = W["Min-Varianz"]
     explain([
-        f"Dein Portfolio (roter Punkt) liegt bei {pc(cv)} Schwankung und {pc(cr)} erwarteter Rendite.",
+        f"Dein Portfolio (türkiser Punkt) liegt bei {pc(cv)} Schwankung und {pc(cr)} erwarteter Rendite.",
         (f"Bei gleicher Schwankung wären bis zu **{de(gap * 100)} Prozentpunkte mehr Rendite pro Jahr** möglich gewesen – "
          "so weit liegt dein Punkt unter der Linie.") if gap > 0.005 else
         "Dein Portfolio liegt praktisch auf der Efficient Frontier – es war bereits effizient aufgeteilt.",
@@ -1540,13 +1686,22 @@ INFO_KEYS = ["shortName", "longName", "quoteType", "sector", "industry", "countr
              "numberOfAnalystOpinions", "targetMeanPrice"]
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def get_info(t):
+def _info_raw(t):
     try:
         info = yf.Ticker(t).info or {}
     except Exception:
         info = {}
     return {k: info.get(k) for k in INFO_KEYS}
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def get_info(t):
+    return _info_raw(t)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def infos_many(tickers):
+    return dict(zip(tickers, pmap(_info_raw, tickers)))
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
@@ -1570,8 +1725,7 @@ def get_fin(t):
     return res
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_news(t, n=10):
+def _news_raw(t, n=10):
     try:
         items = yf.Ticker(t).news or []
     except Exception:
@@ -1591,6 +1745,16 @@ def get_news(t, n=10):
         if title and url:
             out.append({"title": title, "url": url, "prov": prov, "ts": ts, "summary": summ[:320], "t": t})
     return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_news(t, n=10):
+    return _news_raw(t, n)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def news_many(tickers, n):
+    return dict(zip(tickers, pmap(lambda t: _news_raw(t, n), tickers)))
 
 
 def fmt_big(x, cur=""):
@@ -1676,9 +1840,9 @@ def classify(t, i):
     return "Einzelaktie"
 
 
-def test_candidate(sym, R, rp_c, rf):
+def test_candidate(sym, R, rp_c, rf, pre=None):
     """Rechnet: Was passiert, wenn 10 % des Portfolios in sym gehen?"""
-    s = load(sym, start, end)
+    s = pre.get(sym) if pre is not None else load(sym, start, end)
     if s is None:
         return None
     r = s.pct_change().dropna().reindex(R.index).dropna()
@@ -1708,7 +1872,7 @@ def page_info():
          "Die Zahlen kommen von Yahoo Finance und werden einmal pro Tag aktualisiert. Beträge sind in der Währung des "
          "Unternehmens angegeben. Bei ETFs gibt es keine Unternehmenskennzahlen, dafür Kosten und Fondsgröße.")
     with st.spinner("Lade Unternehmensdaten …"):
-        infos = {t: get_info(t) for t in assets}
+        infos = infos_many(tuple(assets))
     if not any(v.get("quoteType") or v.get("shortName") for v in infos.values()):
         st.warning("Yahoo Finance liefert gerade keine Unternehmensdaten (vermutlich zu viele Anfragen). Versuch es in "
                    "ein paar Minuten noch einmal – die Analyse unten ist bis dahin unvollständig.")
@@ -1779,9 +1943,9 @@ def page_info():
         st.subheader("Umsatz und Gewinn der letzten Jahre", help=f"Geschäftsjahre laut Jahresabschluss, in {fcur}.")
         fg = go.Figure()
         if "Umsatz" in fin:
-            fg.add_bar(x=fin.index, y=fin["Umsatz"], name="Umsatz", marker_color="#b8c4e8")
+            fg.add_bar(x=fin.index, y=fin["Umsatz"], name="Umsatz", marker_color=PRI_L)
         if "Gewinn" in fin:
-            fg.add_bar(x=fin.index, y=fin["Gewinn"], name="Gewinn", marker_color="#1240e0")
+            fg.add_bar(x=fin.index, y=fin["Gewinn"], name="Gewinn", marker_color=PRI)
         fg.update_layout(barmode="group", height=400, margin=dict(l=10, r=10, t=10, b=10), separators=",.",
                          legend=dict(orientation="h", y=1.08), font=dict(size=15))
         st.plotly_chart(fg, width="stretch")
@@ -1855,7 +2019,7 @@ def page_improve():
                    "siehst du jetzt, ob der Optimierer ihm Gewicht gibt.")
         del ss.added_msg
     with st.spinner("Analysiere deine Wertpapiere …"):
-        infos = {t: get_info(t) for t in assets}
+        infos = infos_many(tuple(assets))
     if not any(v.get("quoteType") or v.get("shortName") for v in infos.values()):
         st.warning("Yahoo Finance liefert gerade keine Unternehmensdaten (vermutlich zu viele Anfragen). Versuch es in "
                    "ein paar Minuten noch einmal – die Analyse unten ist bis dahin unvollständig.")
@@ -1927,6 +2091,10 @@ def page_improve():
 
     todo = list(dict.fromkeys(key for ok, _, _, key in checks if not ok))
     rp_c = R.values @ cur
+    stocks = [j for j, t in enumerate(assets) if cls[j] == "Einzelaktie" and infos[t].get("sector") in PEERS]
+    need = [s_ for k in todo for s_, _ in CAND[k]] + [s_ for j in stocks for s_, _ in PEERS[infos[assets[j]]["sector"]]]
+    with st.spinner("Lade Vergleichswerte …"):
+        pre = load_many(tuple(sorted(set(n_ for n_ in need if n_ not in assets))), start, end)
     if todo:
         st.subheader("Ideen zum Ergänzen – durchgerechnet",
                      help="Für jede Idee rechnet die App mit deinen echten Kursdaten: Was wäre passiert, wenn 10 % deines "
@@ -1941,8 +2109,7 @@ def page_improve():
             for sym, nm in CAND[key]:
                 if sym in held:
                     continue
-                with st.spinner(f"Teste {nm} …"):
-                    res = test_candidate(sym, R, rp_c, rf)
+                res = test_candidate(sym, R, rp_c, rf, pre)
                 if res is None:
                     rows.append({"Idee": nm, "Ticker": sym, "Zusammenhang mit deinem Portfolio": "keine Daten",
                                  "Schwankung mit 10 %": "–", "Schlimmster Absturz mit 10 %": "–", "Gewinn pro Risiko mit 10 %": "–"})
@@ -1977,7 +2144,6 @@ def page_improve():
         st.success("Dein Portfolio besteht alle Prüfpunkte. Du bist breit aufgestellt.")
 
     # Ähnliche Alternativen
-    stocks = [j for j, t in enumerate(assets) if cls[j] == "Einzelaktie" and infos[t].get("sector") in PEERS]
     st.subheader("Ähnliche Alternativen zu deinen Aktien",
                  help="Für jede Einzelaktie bekannte Unternehmen aus derselben Branche, im selben Zeitraum verglichen. "
                       "Ein besserer Wert in der Vergangenheit ist keine Garantie für die Zukunft.")
@@ -1995,7 +2161,7 @@ def page_improve():
             for sym, nm in PEERS[sector]:
                 if sym in assets:
                     continue
-                s = load(sym, start, end)
+                s = pre.get(sym)
                 if s is None:
                     continue
                 r = s.pct_change().dropna().reindex(R.index).dropna()
@@ -2050,8 +2216,9 @@ def news_cards(items, show_t=True):
 
 def merge_news(tickers, n):
     seen, out = set(), []
+    nm = news_many(tuple(tickers), n)
     for t in tickers:
-        for it in get_news(t, n):
+        for it in nm[t]:
             if it["url"] not in seen:
                 seen.add(it["url"])
                 out.append(it)
@@ -2095,11 +2262,7 @@ BENCHES = {"MSCI World (iShares, EUNL.DE)": "EUNL.DE", "S&P 500 (iShares, SXR8.D
 
 def long_returns(tickers):
     """Monatsrenditen mit möglichst langer Historie (ab 1999), Lücken bleiben NaN."""
-    ser = {}
-    for t in tickers:
-        s = load(t, LONG_START, date.today())
-        if s is not None:
-            ser[t] = s
+    ser = load_many(tuple(tickers), LONG_START, date.today())
     if not ser:
         return pd.DataFrame()
     return pd.concat(ser, axis=1).sort_index().pct_change(fill_method=None)
@@ -2171,7 +2334,7 @@ def page_stress():
     st.subheader("Verlust in jeder Krise", help="Wie viel dein Depot vom Beginn bis zum Tiefpunkt der Krise verloren "
                                                 "hätte. Zum Vergleich der US-Aktienmarkt (S&P 500).")
     fg = go.Figure()
-    for lab, col in (("Dein Depot", "#e8361b"), ("Vorschlag", "#1240e0"), ("S&P 500", "#999")):
+    for lab, col in (("Dein Depot", SEC), ("Vorschlag", PRI), ("S&P 500", "#999")):
         fg.add_bar(x=[r["Krise"] for r in rows], y=[r.get(lab) for r in rows], name=lab, marker_color=col,
                    text=[pc(r[lab], 0) if r.get(lab) is not None else "keine Daten" for r in rows], textposition="outside")
     fg.update_layout(barmode="group", height=480, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
@@ -2197,7 +2360,7 @@ def page_stress():
     if pick:
         idx, path = paths[pick]
         fp = go.Figure(go.Scatter(x=idx.to_timestamp(), y=V * np.r_[path], mode="lines+markers",
-                                  line=dict(color="#e8361b", width=3)))
+                                  line=dict(color=SEC, width=3)))
         fp.add_hline(y=V, line_dash="dot", line_color="gray", annotation_text="Wert vor der Krise")
         fp.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€", separators=",.",
                          font=dict(size=15))
@@ -2283,8 +2446,8 @@ def page_vs_market():
             "Besser?": ["deine Wahl" if v >= b else "der Index" for v, b in zip(df_["val"], df_["bench"])]}),
             hide_index=True, width="stretch")
         fg = go.Figure()
-        fg.add_bar(x=df_["n"], y=df_["val"], name="Deine Position", marker_color="#1240e0")
-        fg.add_bar(x=df_["n"], y=df_["bench"], name=f"Mit {bname.split(' (')[0]}", marker_color="#b8c4e8")
+        fg.add_bar(x=df_["n"], y=df_["val"], name="Deine Position", marker_color=PRI)
+        fg.add_bar(x=df_["n"], y=df_["bench"], name=f"Mit {bname.split(' (')[0]}", marker_color=PRI_L)
         fg.update_layout(barmode="group", height=420, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€",
                          separators=",.", legend=dict(orientation="h", y=1.08), font=dict(size=15))
         st.plotly_chart(fg, width="stretch")
@@ -2305,7 +2468,7 @@ def page_vs_market():
     brv = br[ok_].values
     idx = R.index[ok_.values].to_timestamp()
     f2 = go.Figure()
-    f2.add_scatter(x=idx, y=V * np.cumprod(1 + rp), name="Dein Depot (heutige Aufteilung)", line=dict(color="#e8361b", width=3))
+    f2.add_scatter(x=idx, y=V * np.cumprod(1 + rp), name="Dein Depot (heutige Aufteilung)", line=dict(color=SEC, width=3))
     f2.add_scatter(x=idx, y=V * np.cumprod(1 + brv), name=bname.split(" (")[0], line=dict(color="#555", width=3))
     f2.update_layout(height=460, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€", separators=",.",
                      legend=dict(orientation="h", y=1.08), hovermode="x unified", font=dict(size=15))
@@ -2410,10 +2573,10 @@ def page_savings():
               help="Anteil der Simulationen, die am Ende mindestens dein Ziel erreichen.")
     st.subheader("Mögliche Entwicklung", help="Linie = mittlerer Fall, Fläche = Bereich von 9 von 10 Simulationen, "
                                               "gestrichelt = eingezahltes Geld.")
-    fg = go.Figure(fan(x, vals, "Depot", "#1240e0", "rgba(18,64,224,0.15)"))
+    fg = go.Figure(fan(x, vals, "Depot", PRI, PRI_A))
     fg.add_scatter(x=x, y=paid, name="Eingezahlt", line=dict(color="#555", dash="dash", width=2))
     if goal_v > 0:
-        fg.add_hline(y=goal_v, line_color="#0b7a3b", line_dash="dot", annotation_text="Dein Ziel")
+        fg.add_hline(y=goal_v, line_color=GAIN, line_dash="dot", annotation_text="Dein Ziel")
     fg.update_layout(height=520, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Jahre", yaxis_title="€",
                      separators=",.", legend=dict(orientation="h", y=-0.15), font=dict(size=15))
     st.plotly_chart(fg, width="stretch")
@@ -2508,7 +2671,7 @@ def page_withdraw():
               help="Summe aller geplanten Entnahmen.")
     x = np.arange(1, m + 1) / 12
     st.subheader("Wie sich dein Kapital entwickeln könnte", help="Linie = mittlerer Fall, Fläche = 9 von 10 Simulationen.")
-    fg = go.Figure(fan(x, vals, "Kapital", "#1240e0", "rgba(18,64,224,0.15)"))
+    fg = go.Figure(fan(x, vals, "Kapital", PRI, PRI_A))
     fg.update_layout(height=480, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Jahre", yaxis_title="€",
                      separators=",.", legend=dict(orientation="h", y=-0.15), font=dict(size=15))
     st.plotly_chart(fg, width="stretch")
@@ -2530,8 +2693,7 @@ def page_withdraw():
 # =====================================================================
 # Seite: Dividenden
 # =====================================================================
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def get_divs(t):
+def _divs_raw(t):
     try:
         s = yf.Ticker(t).dividends
     except Exception:
@@ -2540,6 +2702,11 @@ def get_divs(t):
         return None
     s = pd.Series(pd.to_numeric(s, errors="coerce").values, index=pd.to_datetime(s.index, utc=True)).dropna()
     return s[s.index >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=372)]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def divs_many(tickers):
+    return dict(zip(tickers, pmap(_divs_raw, tickers)))
 
 
 MONTHS = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
@@ -2554,12 +2721,13 @@ def page_div():
     taxr = ss.tax / 100
     rows, cal = [], np.zeros((len(assets), 12))
     with st.spinner("Lade Dividenden …"):
+        qq, dd = quotes_many(tuple(assets)), divs_many(tuple(assets))
         for i, t in enumerate(assets):
-            price, cur_ = get_quote(t)
-            fx = get_fx(cur_) or 0
+            price, cur_, fx = qq[t]
+            fx = fx or 0
             pe = price * fx if price else None
             shares = (dep.loc[t, "qty"] if dep is not None else (cur[i] * V / pe if pe else 0))
-            dv = get_divs(t)
+            dv = dd[t]
             per_share = float(dv.sum()) if dv is not None else 0.0
             if dv is not None:
                 for ts, amt in dv.items():
@@ -2643,7 +2811,7 @@ def build_pdf(c, with_stress):
     pdf.add_font("DV", "B", os.path.join(fdir, "DejaVuSans-Bold.ttf"))
     pdf.set_auto_page_break(True, 15)
     pdf.add_page()
-    BLUE = (18, 64, 224)
+    BLUE = (37, 99, 235)
 
     def h1(t):
         pdf.set_font("DV", "B", 20)
@@ -2726,8 +2894,8 @@ def build_pdf(c, with_stress):
         p(f"Mit {eur(newm)} neuem Geld" + (", ohne Verkäufe (nur nachkaufen)." if nosell else "."), 9)
     fig, ax = plt.subplots(figsize=(8, 0.5 + 0.45 * len(names)))
     yy = np.arange(len(names))
-    ax.barh(yy + 0.2, cur * 100, 0.4, label="Jetzt", color="#b8c4e8")
-    ax.barh(yy - 0.2, tw * 100, 0.4, label="Vorschlag", color="#1240e0")
+    ax.barh(yy + 0.2, cur * 100, 0.4, label="Jetzt", color=PRI_L)
+    ax.barh(yy - 0.2, tw * 100, 0.4, label="Vorschlag", color=PRI)
     ax.set_yticks(yy, names)
     ax.invert_yaxis()
     ax.set_xlabel("Anteil in %")
@@ -2737,8 +2905,8 @@ def build_pdf(c, with_stress):
     h2("So hätte sich dein Geld entwickelt", need=95)
     R = c["R"]
     fig, ax = plt.subplots(figsize=(8, 3.4))
-    ax.plot(R.index.to_timestamp(), V * np.cumprod(1 + R.values @ cur), color="#e8361b", lw=2, label="Jetziges Portfolio")
-    ax.plot(R.index.to_timestamp(), V * np.cumprod(1 + R.values @ tw), color="#1240e0", lw=2, label="Vorschlag")
+    ax.plot(R.index.to_timestamp(), V * np.cumprod(1 + R.values @ cur), color=SEC, lw=2, label="Jetziges Portfolio")
+    ax.plot(R.index.to_timestamp(), V * np.cumprod(1 + R.values @ tw), color=PRI, lw=2, label="Vorschlag")
     ax.set_ylabel("€")
     ax.legend()
     ax.spines[["top", "right"]].set_visible(False)
@@ -2975,16 +3143,29 @@ def tr_load():
         ss.tr, ss.tr_err = None, str(e)
 
 
+@st.cache_data(ttl=30 * 24 * 3600, show_spinner=False)
+def isin_many(items):
+    """ISIN → Yahoo-Ticker für viele Positionen parallel."""
+    def one(it):
+        sym, name, cls = it
+        if cls == "CRYPTO":
+            return f"{sym}-EUR"
+        res = _search_raw(sym) or _search_raw(name)
+        return res[0]["sym"] if res else ""
+    return dict(zip([i[0] for i in items], pmap(one, items)))
+
+
 def tr_valuation(tr):
     rows = []
-    for _, h_ in tr["hold"].iterrows():
+    hold = tr["hold"]
+    todo = tuple((r_["symbol"], r_["name"], r_["cls"]) for _, r_ in hold.iterrows() if r_["symbol"] not in ss.tr_map)
+    if todo:
+        ss.tr_map.update(isin_many(todo))
+    qq = quotes_many(tuple(t for t in (ss.tr_map.get(s_) for s_ in hold["symbol"]) if t)) if len(hold) else {}
+    for _, h_ in hold.iterrows():
         sym, cls = h_["symbol"], h_["cls"]
-        tk = ss.tr_map.get(sym)
-        if tk is None:
-            tk = isin_to_ticker(sym, h_["name"], cls) or ""
-            ss.tr_map[sym] = tk
-        price, cur_ = get_quote(tk) if tk else (None, None)
-        fx = get_fx(cur_) if price is not None else None
+        tk = ss.tr_map.get(sym) or ""
+        price, cur_, fx = qq.get(tk, (None, None, None)) if tk else (None, None, None)
         pe = price * fx if price is not None and fx is not None else None
         val = h_["qty"] * pe if pe is not None else None
         rows.append({"symbol": sym, "ticker": tk, "name": h_["name"], "krypto": cls == "CRYPTO",
@@ -3108,7 +3289,7 @@ def page_tr():
         st.page_link(P_KONTO, label="Alle Zahlungen im Detail", icon=":material/account_balance:")
 
     cA, cB = st.columns([3, 2], gap="large")
-    for col, d, title, colr in ((cA, sec, "Wertpapiere (Aktien, ETFs, Fonds)", "#1240e0"), (cB, cry, "Krypto", "#f7931a")):
+    for col, d, title, colr in ((cA, sec, "Wertpapiere (Aktien, ETFs, Fonds)", PRI), (cB, cry, "Krypto", SEC)):
         with col.container(border=True):
             st.subheader(title, help="Unrealisierter Gewinn/Verlust = Wert heute minus Einstandskosten (Durchschnitts"
                                      "kosten inkl. Kaufgebühren) der noch gehaltenen Stücke.")
@@ -3131,7 +3312,7 @@ def page_tr():
             st.caption(f"{len(d)} {'Position' if len(d) == 1 else 'Positionen'} offen · {len(rr)} Verkäufe bisher")
     st.subheader("Wie dein Vermögen verteilt ist")
     fd = go.Figure(go.Pie(labels=["Wertpapiere", "Krypto", "Cash"], values=[val_sec, val_cry, max(cash, 0)], hole=0.55,
-                          marker=dict(colors=["#1240e0", "#f7931a", "#9aa7c7"]), textinfo="label+percent", sort=False))
+                          marker=dict(colors=[PRI, SEC, GREY]), textinfo="label+percent", sort=False))
     fd.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), showlegend=False, font=dict(size=15), separators=",.")
     st.plotly_chart(fd, width="stretch")
 
@@ -3169,7 +3350,7 @@ def page_tr():
             dk = d[d["gain"].notna()].sort_values("gain")
             if len(dk):
                 fg = go.Figure(go.Bar(y=dk["name"], x=dk["gain"], orientation="h",
-                                      marker_color=["#0b7a3b" if x >= 0 else "#e8361b" for x in dk["gain"]],
+                                      marker_color=[GAIN if x >= 0 else LOSS for x in dk["gain"]],
                                       text=[("+" if x >= 0 else "−") + eur(abs(x)) for x in dk["gain"]], textposition="outside"))
                 fg.update_layout(height=80 + 32 * len(dk), margin=dict(l=10, r=50, t=10, b=10), xaxis_title="€",
                                  separators=",.", font=dict(size=14))
@@ -3187,7 +3368,7 @@ def page_tr():
             rr["Art"] = np.where(rr["cls"] == "CRYPTO", "Krypto", "Wertpapiere")
             pv = rr.pivot_table(index="Jahr", columns="Art", values="gain", aggfunc="sum").fillna(0)
             fy = go.Figure([go.Bar(x=pv.index.astype(str), y=pv[c], name=c,
-                                   marker_color="#f7931a" if c == "Krypto" else "#1240e0") for c in pv.columns])
+                                   marker_color=SEC if c == "Krypto" else PRI) for c in pv.columns])
             fy.update_layout(barmode="group", height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€",
                              separators=",.", legend=dict(orientation="h", y=1.1), font=dict(size=15))
             st.subheader("Realisierte Gewinne pro Jahr", help="Durchschnittskosten-Methode. Das Finanzamt rechnet bei "
@@ -3203,8 +3384,8 @@ def page_tr():
         if len(dv):
             dv["Jahr"] = dv["day"].dt.year
             yy = dv.groupby("Jahr")[["amount", "tax"]].sum()
-            fz = go.Figure([go.Bar(x=yy.index.astype(str), y=yy["amount"], name="Dividenden brutto", marker_color="#1240e0"),
-                            go.Bar(x=yy.index.astype(str), y=yy["amount"] + yy["tax"], name="netto", marker_color="#b8c4e8")])
+            fz = go.Figure([go.Bar(x=yy.index.astype(str), y=yy["amount"], name="Dividenden brutto", marker_color=PRI),
+                            go.Bar(x=yy.index.astype(str), y=yy["amount"] + yy["tax"], name="netto", marker_color=PRI_L)])
             fz.update_layout(barmode="group", height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€",
                              separators=",.", legend=dict(orientation="h", y=1.1), font=dict(size=15))
             st.subheader("Dividenden pro Jahr")
@@ -3315,10 +3496,10 @@ def page_real():
               real.loc[real["gain"].idxmin(), "name"], delta_color="off")
     cA, cB = st.columns(2, gap="large")
     with cA:
-        real_block(real[real["Art"] == "Wertpapiere"], "Wertpapiere", "#1240e0")
+        real_block(real[real["Art"] == "Wertpapiere"], "Wertpapiere", PRI)
     with cB:
         if (real["Art"] == "Krypto").any():
-            real_block(real[real["Art"] == "Krypto"], "Krypto", "#f7931a")
+            real_block(real[real["Art"] == "Krypto"], "Krypto", SEC)
         else:
             st.container(border=True).caption("Keine Krypto-Verkäufe.")
 
@@ -3329,7 +3510,7 @@ def page_real():
                                               tage=("tage", "mean")).reset_index().sort_values("gew")
         st.subheader("Gewinn/Verlust je Wertpapier", help="Alle Verkäufe eines Wertpapiers zusammengefasst.")
         fg = go.Figure(go.Bar(y=g["name"], x=g["gew"], orientation="h",
-                              marker_color=["#0b7a3b" if x >= 0 else "#e8361b" for x in g["gew"]],
+                              marker_color=[GAIN if x >= 0 else LOSS for x in g["gew"]],
                               text=[("+" if x >= 0 else "−") + eur(abs(x)) for x in g["gew"]], textposition="outside"))
         fg.update_layout(height=80 + 30 * len(g), margin=dict(l=10, r=60, t=10, b=10), xaxis_title="€",
                          separators=",.", font=dict(size=14))
@@ -3354,7 +3535,7 @@ def page_real():
                                                  "verrechnet. In Deutschland sind 1.000 € pro Jahr (Sparer-Pauschbetrag) "
                                                  "steuerfrei, wenn ein Freistellungsauftrag vorliegt.")
         fy = go.Figure([go.Bar(x=pv.index.astype(str), y=pv[c], name=c,
-                               marker_color="#f7931a" if c == "Krypto" else "#1240e0",
+                               marker_color=SEC if c == "Krypto" else PRI,
                                text=[("+" if v_ >= 0 else "−") + eur(abs(v_)) for v_ in pv[c]], textposition="outside")
                         for c in pv.columns])
         fy.update_layout(barmode="group", height=400, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="€",
@@ -3372,7 +3553,7 @@ def page_real():
         st.subheader("Realisierte Gewinne über die Zeit", help="Aufsummiert: Wie sich dein realisiertes Ergebnis mit "
                                                               "jedem Verkauf entwickelt hat.")
         fc = go.Figure()
-        for art, col in (("Wertpapiere", "#1240e0"), ("Krypto", "#f7931a")):
+        for art, col in (("Wertpapiere", PRI), ("Krypto", SEC)):
             s_ = rs[rs["Art"] == art]
             if len(s_):
                 fc.add_scatter(x=s_["day"], y=s_["gain"].cumsum(), name=art, mode="lines+markers", line=dict(color=col, width=3),
@@ -3416,8 +3597,8 @@ def page_real():
                                     measure=["relative"] * len(parts) + ["total"],
                                     text=[("+" if x >= 0 else "−") + eur(abs(x)) for _, x in parts] +
                                          [("+" if sum(x for _, x in parts) >= 0 else "−") + eur(abs(sum(x for _, x in parts)))],
-                                    textposition="outside", increasing=dict(marker_color="#0b7a3b"),
-                                    decreasing=dict(marker_color="#e8361b"), totals=dict(marker_color="#1240e0")))
+                                    textposition="outside", increasing=dict(marker_color=GAIN),
+                                    decreasing=dict(marker_color=LOSS), totals=dict(marker_color=PRI)))
         fw.update_layout(height=440, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="€", separators=",.",
                          font=dict(size=15))
         st.plotly_chart(fw, width="stretch")
@@ -3485,10 +3666,10 @@ def page_konto():
     k4.metric("Zinsen (netto)", eur(tot("Zinsen (netto)")), help="Zinsen aufs Guthaben nach Steuern.")
 
     kt["Monat"] = kt["day"].dt.to_period("M").dt.to_timestamp()
-    st.subheader("Geldflüsse pro Monat", help="Grün = Geld kommt aufs Konto, Rot = Überweisungen raus, Orange = Karte.")
+    st.subheader("Geldflüsse pro Monat", help="Grün = Geld kommt aufs Konto, Rot = Überweisungen raus, Türkis = Karte, Blau = Zinsen.")
     fg = go.Figure()
-    for topf, col in (("Einzahlungen", "#0b7a3b"), ("Überweisungen raus", "#e8361b"), ("Kartenzahlungen", "#f7931a"),
-                      ("Zinsen (netto)", "#1240e0"), ("Geschenke", "#9aa7c7")):
+    for topf, col in (("Einzahlungen", GAIN), ("Überweisungen raus", LOSS), ("Kartenzahlungen", SEC),
+                      ("Zinsen (netto)", PRI), ("Geschenke", GREY)):
         s_ = kt[kt["topf"] == topf].groupby("Monat")["effekt"].sum()
         if len(s_):
             fg.add_bar(x=s_.index, y=s_.values, name=topf, marker_color=col)
@@ -3540,8 +3721,8 @@ def page_konto():
             x=[f"{t_}" for _, t_ in order] + ["Kontostand"], y=[g[k] for k in order] + [0],
             measure=["relative"] * len(order) + ["total"],
             text=[("+" if g[k] >= 0 else "−") + eur(abs(g[k])) for k in order] + [eur(S_["kontostand"])],
-            textposition="outside", increasing=dict(marker_color="#0b7a3b"), decreasing=dict(marker_color="#e8361b"),
-            totals=dict(marker_color="#1240e0")))
+            textposition="outside", increasing=dict(marker_color=GAIN), decreasing=dict(marker_color=LOSS),
+            totals=dict(marker_color=PRI)))
         fw.update_layout(height=480, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="€", separators=",.",
                          font=dict(size=13))
         st.plotly_chart(fw, width="stretch")
@@ -3655,7 +3836,7 @@ menu = {"Start": [P_INPUT, P_TR, P_REAL, P_KONTO, P_DEPOT, P_OVER],
 if expert:
     menu["Experten"] = [P_FRONT, P_STYLE, P_COMP]
 menu["Bericht & Hilfe"] = [P_PDF, P_HELP]
-pg = st.navigation(menu)
+pg = st.navigation(menu, expanded=True)
 pg.run()
 with st.sidebar.expander("Depot speichern & laden", icon=":material/save:"):
     st.caption("Deine Eingaben werden nicht auf dem Server gespeichert. Sichere sie als Datei und lade sie beim "
