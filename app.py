@@ -105,6 +105,14 @@ GLOSSAR = {
     "Style Analysis": "Welche Mischung deiner Wertpapiere einen Index (z. B. den DAX) am besten nachbildet.",
     "VaR / CVaR": "Value at Risk: Monatsverlust, der in 19 von 20 Monaten nicht überschritten wurde. CVaR: "
                   "durchschnittlicher Verlust in den übrigen, schlechtesten Monaten.",
+    "KGV (Kurs-Gewinn-Verhältnis)": "Aktienkurs geteilt durch Gewinn pro Aktie. Wie viele Jahresgewinne du für das "
+                                    "Unternehmen bezahlst. Grob: unter 12 günstig, 12–25 üblich, über 25 teuer.",
+    "Börsenwert (Marktkapitalisierung)": "Was ein Unternehmen an der Börse insgesamt wert ist: Kurs × Anzahl Aktien.",
+    "Dividendenrendite": "Jährliche Ausschüttung an die Aktionäre im Verhältnis zum Aktienkurs.",
+    "Gewinnmarge": "Wie viel vom Umsatz als Gewinn übrig bleibt.",
+    "Beta": "Wie stark eine Aktie im Vergleich zum Gesamtmarkt schwankt. 1 = wie der Markt.",
+    "Anleihen": "Kredite an Staaten oder Unternehmen, die Zinsen zahlen. Schwanken meist weniger als Aktien.",
+    "ETF": "Ein börsengehandelter Fonds, der viele Wertpapiere bündelt (z. B. alle großen Firmen der Welt).",
     "Ticker / ISIN": "Ticker ist das Börsenkürzel bei Yahoo (z. B. AAPL, SAP.DE). Die ISIN ist die weltweit "
                      "eindeutige Nummer eines Wertpapiers (z. B. US0378331005) – steht in deinem Depot.",
 }
@@ -1094,6 +1102,558 @@ def page_help():
 
 
 # =====================================================================
+# Unternehmensdaten, Empfehlungen, Nachrichten – Daten
+# =====================================================================
+INFO_KEYS = ["shortName", "longName", "quoteType", "sector", "industry", "country", "currency", "financialCurrency",
+             "marketCap", "trailingPE", "forwardPE", "priceToBook", "totalRevenue", "netIncomeToCommon",
+             "profitMargins", "revenueGrowth", "earningsGrowth", "dividendRate", "trailingAnnualDividendYield",
+             "currentPrice", "regularMarketPrice", "previousClose", "beta", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
+             "longBusinessSummary", "category", "totalAssets", "fundFamily", "netExpenseRatio",
+             "annualReportExpenseRatio", "website", "fullTimeEmployees", "recommendationKey",
+             "numberOfAnalystOpinions", "targetMeanPrice"]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def get_info(t):
+    try:
+        info = yf.Ticker(t).info or {}
+    except Exception:
+        info = {}
+    return {k: info.get(k) for k in INFO_KEYS}
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def get_fin(t):
+    try:
+        df = yf.Ticker(t).income_stmt
+    except Exception:
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    out = {}
+    for key, rows in {"Umsatz": ["Total Revenue", "TotalRevenue"],
+                      "Gewinn": ["Net Income", "NetIncome", "Net Income Common Stockholders"]}.items():
+        row = next((df.loc[r] for r in rows if r in df.index), None)
+        if row is not None:
+            out[key] = pd.to_numeric(row, errors="coerce")
+    if not out:
+        return None
+    res = pd.DataFrame(out).dropna(how="all").sort_index()
+    res.index = [str(getattr(i, "year", i)) for i in res.index]
+    return res
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_news(t, n=10):
+    try:
+        items = yf.Ticker(t).news or []
+    except Exception:
+        items = []
+    out = []
+    for it in items[:n]:
+        c = it.get("content", it) if isinstance(it, dict) else {}
+        title = c.get("title")
+        url = ((c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
+               or c.get("link"))
+        prov = (c.get("provider") or {}).get("displayName") if isinstance(c.get("provider"), dict) else None
+        prov = prov or c.get("publisher") or ""
+        ts = c.get("pubDate") or c.get("displayTime") or c.get("providerPublishTime")
+        ts = (pd.to_datetime(ts, unit="s", utc=True) if isinstance(ts, (int, float))
+              else pd.to_datetime(ts, utc=True, errors="coerce"))
+        summ = re.sub(r"<[^>]+>", "", c.get("summary") or c.get("description") or "").strip()
+        if title and url:
+            out.append({"title": title, "url": url, "prov": prov, "ts": ts, "summary": summ[:320], "t": t})
+    return out
+
+
+def fmt_big(x, cur=""):
+    if x is None or x != x:
+        return "–"
+    a = abs(x)
+    s = (de(x / 1e12, 2) + " Bio." if a >= 1e12 else de(x / 1e9, 1) + " Mrd." if a >= 1e9
+         else de(x / 1e6, 0) + " Mio." if a >= 1e6 else de(x, 0))
+    return f"{s} {cur}".strip()
+
+
+def num(x, d=1):
+    return "–" if x is None or x != x else de(x, d)
+
+
+def pct_or(x, d=1):
+    return "–" if x is None or x != x else pc(x, d)
+
+
+def div_yield(i):
+    p = i.get("currentPrice") or i.get("regularMarketPrice") or i.get("previousClose")
+    if i.get("dividendRate") and p:
+        return i["dividendRate"] / p
+    return i.get("trailingAnnualDividendYield")
+
+
+SECTOR_DE = {"Technology": "Technologie", "Healthcare": "Gesundheit", "Financial Services": "Finanzen",
+             "Consumer Defensive": "Basiskonsum", "Consumer Cyclical": "Zyklischer Konsum", "Energy": "Energie",
+             "Industrials": "Industrie", "Utilities": "Versorger", "Basic Materials": "Rohstoffe & Chemie",
+             "Communication Services": "Kommunikation", "Real Estate": "Immobilien"}
+
+COUNTRY_DE = {"United States": "USA", "Germany": "Deutschland", "United Kingdom": "Großbritannien",
+              "Switzerland": "Schweiz", "France": "Frankreich", "Netherlands": "Niederlande", "Denmark": "Dänemark",
+              "Japan": "Japan", "China": "China", "Taiwan": "Taiwan", "Ireland": "Irland", "Italy": "Italien",
+              "Spain": "Spanien", "Canada": "Kanada", "Sweden": "Schweden", "Malaysia": "Malaysia",
+              "South Korea": "Südkorea", "Austria": "Österreich", "Belgium": "Belgien", "Norway": "Norwegen"}
+
+
+def country(i):
+    return COUNTRY_DE.get(i.get("country"), i.get("country"))
+
+
+PEERS = {
+    "Technology": [("MSFT", "Microsoft"), ("AAPL", "Apple"), ("NVDA", "Nvidia"), ("SAP.DE", "SAP"), ("ASML.AS", "ASML")],
+    "Healthcare": [("JNJ", "Johnson & Johnson"), ("NOVO-B.CO", "Novo Nordisk"), ("ROG.SW", "Roche"), ("UNH", "UnitedHealth")],
+    "Financial Services": [("JPM", "JPMorgan"), ("ALV.DE", "Allianz"), ("MUV2.DE", "Munich Re"), ("V", "Visa")],
+    "Consumer Defensive": [("KO", "Coca-Cola"), ("PG", "Procter & Gamble"), ("NESN.SW", "Nestlé"), ("PEP", "PepsiCo")],
+    "Consumer Cyclical": [("AMZN", "Amazon"), ("MC.PA", "LVMH"), ("HD", "Home Depot"), ("MCD", "McDonald's")],
+    "Energy": [("XOM", "ExxonMobil"), ("SHEL.L", "Shell"), ("TTE.PA", "TotalEnergies")],
+    "Industrials": [("SIE.DE", "Siemens"), ("AIR.PA", "Airbus"), ("CAT", "Caterpillar"), ("HON", "Honeywell")],
+    "Utilities": [("NEE", "NextEra Energy"), ("RWE.DE", "RWE"), ("EOAN.DE", "E.ON"), ("IBE.MC", "Iberdrola")],
+    "Basic Materials": [("LIN", "Linde"), ("BAS.DE", "BASF"), ("RIO.L", "Rio Tinto")],
+    "Communication Services": [("GOOGL", "Alphabet"), ("META", "Meta"), ("DTE.DE", "Deutsche Telekom"), ("NFLX", "Netflix")],
+    "Real Estate": [("VNA.DE", "Vonovia"), ("PLD", "Prologis"), ("O", "Realty Income")],
+}
+CAND = {
+    "bonds": [("EUNH.DE", "iShares Core € Govt Bond (Euro-Staatsanleihen)"),
+              ("IEF", "iShares 7-10 Year Treasury (US-Staatsanleihen, USD)"),
+              ("AGG", "iShares Core US Aggregate Bond (USD)")],
+    "gold": [("4GLD.DE", "Xetra-Gold (physisch besichert, EUR)"), ("GLD", "SPDR Gold Shares (USD)")],
+    "broad": [("EUNL.DE", "iShares Core MSCI World"), ("IS3N.DE", "iShares Core MSCI Emerging Markets IMI"),
+              ("VT", "Vanguard Total World Stock (USD)")],
+    "defensive": [("XLP", "Basiskonsum-Sektor-ETF (USD)"), ("XLU", "Versorger-Sektor-ETF (USD)"),
+                  ("XLV", "Gesundheits-Sektor-ETF (USD)")],
+    "intl": [("EXSA.DE", "iShares STOXX Europe 600"), ("IS3N.DE", "iShares Core MSCI Emerging Markets IMI"),
+             ("EUNL.DE", "iShares Core MSCI World")],
+}
+
+
+def classify(t, i):
+    name = f"{i.get('shortName') or ''} {i.get('longName') or ''} {i.get('category') or ''}".lower()
+    qt = (i.get("quoteType") or "").upper()
+    if any(k in name for k in ("bond", "treasury", "govt", "anleihe", "aggregate", "fixed income", "rentenfonds")):
+        return "Anleihen"
+    if any(k in name for k in ("gold", "silver", "silber", "commodity", "rohstoff")) or t in ("GLD", "4GLD.DE"):
+        return "Gold & Rohstoffe"
+    if qt == "CRYPTOCURRENCY":
+        return "Krypto"
+    if qt in ("ETF", "MUTUALFUND"):
+        return "Aktien-ETF / Fonds"
+    if (i.get("sector") or "") == "Real Estate":
+        return "Immobilien"
+    return "Einzelaktie"
+
+
+def test_candidate(sym, R, rp_c, rf):
+    """Rechnet: Was passiert, wenn 10 % des Portfolios in sym gehen?"""
+    s = load(sym, start, end)
+    if s is None:
+        return None
+    r = s.pct_change().dropna().reindex(R.index).dropna()
+    if len(r) < 24:
+        return None
+    base = pd.Series(rp_c, index=R.index).loc[r.index].values
+    mix = 0.9 * base + 0.1 * r.values
+    m0, m1 = metrics(base, rf), metrics(mix, rf)
+    return {"corr": float(np.corrcoef(base, r.values)[0, 1]), "m0": m0, "m1": m1, "n": len(r),
+            "own": metrics(r.values, rf)}
+
+
+def add_test(sym, name):
+    add_ticker(sym, name)
+    ss.amounts[sym] = 0.0
+    ss.added_msg = name
+
+
+# =====================================================================
+# Seite: Unternehmensdaten
+# =====================================================================
+def page_info():
+    c = ready()
+    assets, names = c["assets"], c["names"]
+    head("Unternehmensdaten", "Kennzahlen zu deinen Aktien und ETFs: Bewertung (KGV), Umsatz, Gewinn, Dividende und "
+                              "mehr. Daten von Yahoo Finance.",
+         "Die Zahlen kommen von Yahoo Finance und werden einmal pro Tag aktualisiert. Beträge sind in der Währung des "
+         "Unternehmens angegeben. Bei ETFs gibt es keine Unternehmenskennzahlen, dafür Kosten und Fondsgröße.")
+    with st.spinner("Lade Unternehmensdaten …"):
+        infos = {t: get_info(t) for t in assets}
+    if not any(v.get("quoteType") or v.get("shortName") for v in infos.values()):
+        st.warning("Yahoo Finance liefert gerade keine Unternehmensdaten (vermutlich zu viele Anfragen). Versuch es in "
+                   "ein paar Minuten noch einmal – die Analyse unten ist bis dahin unvollständig.")
+    H = st.column_config.TextColumn
+    rows = []
+    for t, n in zip(assets, names):
+        i = infos[t]
+        rows.append({"Wertpapier": n, "Typ": classify(t, i), "Sektor": SECTOR_DE.get(i.get("sector"), i.get("sector") or "–"),
+                     "Land": country(i) or "–", "Börsenwert": fmt_big(i.get("marketCap"), i.get("currency") or ""),
+                     "KGV": num(i.get("trailingPE")), "KGV erwartet": num(i.get("forwardPE")),
+                     "Dividende": pct_or(div_yield(i)), "Gewinnmarge": pct_or(i.get("profitMargins")),
+                     "Umsatzwachstum": pct_or(i.get("revenueGrowth"))})
+    st.subheader("Alle Werte im Überblick", help="Klick auf eine Spaltenüberschrift sortiert die Tabelle.")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=min(700, 42 + 36 * len(rows)),
+                 column_config={
+                     "Typ": H(help="Einzelaktie, Aktien-ETF/Fonds, Anleihen, Gold & Rohstoffe usw."),
+                     "Börsenwert": H(help="Marktkapitalisierung: Was das ganze Unternehmen an der Börse wert ist "
+                                          "(Aktienkurs × Anzahl Aktien)."),
+                     "KGV": H(help="Kurs-Gewinn-Verhältnis: Aktienkurs geteilt durch Gewinn pro Aktie der letzten 12 "
+                                   "Monate. Wie viele Jahresgewinne du für das Unternehmen bezahlst. Grob: unter 12 "
+                                   "günstig, 12–25 üblich, über 25 teuer – je nach Branche sehr verschieden."),
+                     "KGV erwartet": H(help="Wie das KGV, aber mit dem erwarteten Gewinn der nächsten 12 Monate "
+                                            "(Analystenschätzung). Niedriger als das normale KGV = Gewinne sollen steigen."),
+                     "Dividende": H(help="Dividendenrendite: jährliche Ausschüttung im Verhältnis zum Aktienkurs."),
+                     "Gewinnmarge": H(help="Wie viel vom Umsatz als Gewinn übrig bleibt. 20 % = von 100 € Umsatz "
+                                           "bleiben 20 € Gewinn."),
+                     "Umsatzwachstum": H(help="Veränderung des Umsatzes im letzten Quartal gegenüber dem Vorjahresquartal."),
+                 })
+    st.divider()
+    k = st.selectbox("Wertpapier im Detail ansehen", range(len(assets)), format_func=lambda j: names[j],
+                     help="Wähle ein Wertpapier, um alle Details zu sehen.")
+    t, i = assets[k], infos[assets[k]]
+    cur_ = i.get("currency") or ""
+    fcur = i.get("financialCurrency") or cur_
+    price = i.get("currentPrice") or i.get("regularMarketPrice") or i.get("previousClose")
+    st.header(f"{names[k]} ({t})")
+    st.caption(" · ".join(x for x in [classify(t, i), SECTOR_DE.get(i.get("sector"), i.get("sector")),
+                                      i.get("industry"), country(i)] if x))
+    is_fund = classify(t, i) in ("Aktien-ETF / Fonds", "Anleihen") or (i.get("quoteType") or "") in ("ETF", "MUTUALFUND")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Kurs", f"{num(price, 2)} {cur_}", help="Letzter verfügbarer Kurs.")
+    if is_fund:
+        ter = i.get("netExpenseRatio") or i.get("annualReportExpenseRatio")
+        a2.metric("Fondsvolumen", fmt_big(i.get("totalAssets"), cur_), help="Wie viel Geld insgesamt im Fonds steckt. "
+                  "Größere Fonds sind meist günstiger und werden seltener geschlossen.")
+        a3.metric("Laufende Kosten", "–" if ter is None else (de(ter, 2) + " %" if ter > 0.05 else pc(ter, 2)),
+                  help="TER: Kosten pro Jahr, die vom Fondsvermögen abgezogen werden. Unter 0,3 % ist günstig.")
+        a4.metric("Kategorie", i.get("category") or "–", help="Anlageschwerpunkt laut Yahoo/Morningstar.")
+    else:
+        a2.metric("Börsenwert", fmt_big(i.get("marketCap"), cur_), help="Marktkapitalisierung: Kurs × Anzahl Aktien.")
+        a3.metric("KGV", num(i.get("trailingPE")), help="Kurs-Gewinn-Verhältnis (letzte 12 Monate).")
+        a4.metric("Dividendenrendite", pct_or(div_yield(i)), help="Jährliche Ausschüttung im Verhältnis zum Kurs.")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Umsatz (12 Monate)", fmt_big(i.get("totalRevenue"), fcur), help="Gesamte Verkaufserlöse der letzten 12 Monate.")
+        b2.metric("Gewinn (12 Monate)", fmt_big(i.get("netIncomeToCommon"), fcur), help="Nettogewinn nach Steuern, "
+                  "der den Aktionären zusteht.")
+        b3.metric("Gewinnmarge", pct_or(i.get("profitMargins")), help="Gewinn geteilt durch Umsatz.")
+        b4.metric("Beta", num(i.get("beta"), 2), help="Wie stark die Aktie im Vergleich zum Gesamtmarkt schwankt. "
+                  "1 = wie der Markt, 1,5 = 50 % stärker, 0,5 = halb so stark.")
+    lo52, hi52 = i.get("fiftyTwoWeekLow"), i.get("fiftyTwoWeekHigh")
+    if lo52 and hi52 and price and hi52 > lo52:
+        pos = (price - lo52) / (hi52 - lo52)
+        st.markdown(f"**52-Wochen-Spanne:** {num(lo52, 2)} – {num(hi52, 2)} {cur_}")
+        st.progress(min(1.0, max(0.0, pos)), text=f"Aktueller Kurs liegt bei {pc(pos, 0)} der Jahresspanne "
+                                                   "(0 % = Jahrestief, 100 % = Jahreshoch)")
+    fin = None if is_fund else get_fin(t)
+    if fin is not None and len(fin):
+        st.subheader("Umsatz und Gewinn der letzten Jahre", help=f"Geschäftsjahre laut Jahresabschluss, in {fcur}.")
+        fg = go.Figure()
+        if "Umsatz" in fin:
+            fg.add_bar(x=fin.index, y=fin["Umsatz"], name="Umsatz", marker_color="#b8c4e8")
+        if "Gewinn" in fin:
+            fg.add_bar(x=fin.index, y=fin["Gewinn"], name="Gewinn", marker_color="#1240e0")
+        fg.update_layout(barmode="group", height=400, margin=dict(l=10, r=10, t=10, b=10), separators=",.",
+                         legend=dict(orientation="h", y=1.08), font=dict(size=15))
+        st.plotly_chart(fg, width="stretch")
+    # Interpretation
+    lines = []
+    if is_fund:
+        ter = i.get("netExpenseRatio") or i.get("annualReportExpenseRatio")
+        if ter is not None:
+            terp = ter / 100 if ter > 0.05 else ter
+            lines.append(f"Die laufenden Kosten liegen bei {de(terp * 100, 2)} % pro Jahr – "
+                         + ("günstig." if terp < 0.003 else "im üblichen Bereich." if terp < 0.006 else
+                            "eher teuer. Vergleichbare ETFs gibt es oft günstiger."))
+        lines.append("Ein ETF bündelt viele Wertpapiere. Er ist dadurch schon in sich gestreut – Kennzahlen wie KGV "
+                     "oder Umsatz beziehen sich bei ETFs nicht auf ein einzelnes Unternehmen.")
+    else:
+        pe, fpe = i.get("trailingPE"), i.get("forwardPE")
+        if pe is None:
+            lines.append("Es gibt kein KGV – meist, weil das Unternehmen zuletzt **Verlust** gemacht hat. Dann ist die "
+                         "Aktie besonders schwer zu bewerten.")
+        else:
+            lines.append(f"**KGV {num(pe)}:** Du zahlst etwa das {num(pe, 0)}-Fache des Jahresgewinns. " +
+                         ("Das ist niedrig – entweder günstig, oder der Markt erwartet Probleme." if pe < 12 else
+                          "Das ist ein üblicher Wert." if pe < 25 else
+                          "Das ist hoch – der Markt erwartet starkes Wachstum. Bleibt es aus, kann der Kurs stark fallen."
+                          if pe < 40 else
+                          "Das ist sehr hoch – hier ist viel Zukunftsfantasie eingepreist."))
+        if pe and fpe:
+            lines.append("Das erwartete KGV ist niedriger: Analysten rechnen mit **steigenden Gewinnen**." if fpe < pe * 0.95
+                         else "Das erwartete KGV ist höher: Analysten rechnen mit **sinkenden Gewinnen**." if fpe > pe * 1.05
+                         else "Analysten erwarten ungefähr gleichbleibende Gewinne.")
+        pm = i.get("profitMargins")
+        if pm is not None:
+            lines.append(f"**Gewinnmarge {pc(pm, 0)}:** " + ("Sehr profitabel." if pm > 0.2 else
+                         "Solide profitabel." if pm > 0.08 else "Eher geringe Marge – typisch für Handel, Industrie "
+                         "oder Unternehmen unter Druck." if pm > 0 else "Das Unternehmen macht derzeit Verlust."))
+        b = i.get("beta")
+        if b is not None:
+            lines.append(f"**Beta {num(b, 2)}:** " + ("Schwankt deutlich stärker als der Gesamtmarkt." if b > 1.3 else
+                         "Schwankt ähnlich wie der Markt." if b > 0.8 else "Schwankt weniger als der Markt – eher defensiv."))
+        dy = div_yield(i)
+        if dy:
+            lines.append(f"**Dividende {pc(dy)}:** " + ("Hohe Ausschüttung – prüfe, ob sie durch Gewinne gedeckt ist."
+                         if dy > 0.05 else "Solide Ausschüttung." if dy > 0.02 else "Kleine Ausschüttung – das "
+                         "Unternehmen investiert seine Gewinne eher in Wachstum."))
+        if i.get("recommendationKey") and i.get("numberOfAnalystOpinions"):
+            rk = {"strong_buy": "stark kaufen", "buy": "kaufen", "hold": "halten", "underperform": "unterdurchschnittlich",
+                  "sell": "verkaufen"}.get(i["recommendationKey"], i["recommendationKey"])
+            lines.append(f"Analysten ({i['numberOfAnalystOpinions']}) sagen im Schnitt: **{rk}**"
+                         + (f", Kursziel {num(i.get('targetMeanPrice'), 2)} {cur_}." if i.get("targetMeanPrice") else ".")
+                         + " Analystenmeinungen liegen oft daneben – nimm sie als eine Stimme von vielen.")
+    explain(lines or ["Für dieses Wertpapier liefert Yahoo keine Kennzahlen."])
+    if i.get("longBusinessSummary"):
+        with st.expander("Was macht das Unternehmen? (Beschreibung von Yahoo, Englisch)"):
+            st.write(i["longBusinessSummary"])
+            if i.get("website"):
+                st.markdown(f"[Zur Website]({i['website']})")
+
+
+# =====================================================================
+# Seite: Portfolio verbessern
+# =====================================================================
+def page_improve():
+    c = ready()
+    R, cur, names, assets, V, C = c["R"], c["cur"], c["names"], c["assets"], c["V"], c["C"]
+    head("Portfolio verbessern", "Die App prüft, wie breit dein Portfolio aufgestellt ist, und zeigt Ideen für "
+                                 "Ergänzungen oder Alternativen – jeweils mit deinen echten Daten durchgerechnet.",
+         "Die genannten Wertpapiere sind bekannte Beispiele, keine Kaufempfehlung. Prüfe vor einem Kauf immer "
+         "Kosten, Börsenplatz und ob es zu dir passt.")
+    if "added_msg" in ss:
+        st.success(f"**{ss.added_msg}** wurde mit 0 € zu deiner Auswahl hinzugefügt. Auf **Übersicht & Vorschlag** "
+                   "siehst du jetzt, ob der Optimierer ihm Gewicht gibt.")
+        del ss.added_msg
+    with st.spinner("Analysiere deine Wertpapiere …"):
+        infos = {t: get_info(t) for t in assets}
+    if not any(v.get("quoteType") or v.get("shortName") for v in infos.values()):
+        st.warning("Yahoo Finance liefert gerade keine Unternehmensdaten (vermutlich zu viele Anfragen). Versuch es in "
+                   "ein paar Minuten noch einmal – die Analyse unten ist bis dahin unvollständig.")
+    cls = [classify(t, infos[t]) for t in assets]
+    sec = [SECTOR_DE.get(infos[t].get("sector"), infos[t].get("sector")) if cls[j] in ("Einzelaktie", "Immobilien")
+           else ("Breit gestreut (ETF)" if cls[j] == "Aktien-ETF / Fonds" else cls[j]) for j, t in enumerate(assets)]
+    sec = [s or "Unbekannt" for s in sec]
+    ctry = [(country(infos[t]) or "Unbekannt") if cls[j] == "Einzelaktie" else "ETF / weltweit"
+            for j, t in enumerate(assets)]
+
+    st.subheader("So ist dein Geld verteilt", help="Aufteilung nach Anlageklasse, Sektor (bei Einzelaktien) und "
+                                                   "Land des Unternehmens. ETFs zählen als breit gestreut.")
+    cols = st.columns(3)
+    for col, (title, keys) in zip(cols, [("Anlageklasse", cls), ("Sektor", sec), ("Land", ctry)]):
+        s = pd.Series(cur, index=keys).groupby(level=0).sum().sort_values(ascending=False)
+        fig = go.Figure(go.Pie(labels=s.index, values=s.values, hole=0.55, textinfo="percent",
+                               sort=False))
+        fig.update_layout(title=dict(text=title, x=0.5), height=360, margin=dict(l=10, r=10, t=50, b=10),
+                          legend=dict(orientation="h", y=-0.1), font=dict(size=14), separators=",.")
+        col.plotly_chart(fig, width="stretch")
+
+    share = lambda arr, val: float(sum(w for w, a in zip(cur, arr) if a == val))
+    bonds, gold = share(cls, "Anleihen"), share(cls, "Gold & Rohstoffe")
+    broad = share(cls, "Aktien-ETF / Fonds")
+    stock_sec = pd.Series(cur, index=sec)[[x in ("Einzelaktie", "Immobilien") and s != "Unbekannt"
+                                           for x, s in zip(cls, sec)]].groupby(level=0).sum()
+    top_sec, top_sec_w = (stock_sec.idxmax(), float(stock_sec.max())) if len(stock_sec) else (None, 0.0)
+    stock_c = pd.Series(cur, index=ctry)[[x == "Einzelaktie" and k != "Unbekannt" for x, k in zip(cls, ctry)]].groupby(level=0).sum()
+    top_c, top_c_w = (stock_c.idxmax(), float(stock_c.max())) if len(stock_c) else (None, 0.0)
+    avg_c = round((C.sum() - len(assets)) / max(1, len(assets) * (len(assets) - 1)), 2) + 0.0
+
+    checks = []   # (ok, titel, text, kandidaten-schlüssel)
+    checks.append((bonds > 0.05, "Anleihen",
+                   f"{pc(bonds, 0)} in Anleihen." if bonds > 0.05 else
+                   "Du hast **keine oder kaum Anleihen**. Anleihen (vor allem Staatsanleihen) schwanken weniger als "
+                   "Aktien und fallen in Aktienkrisen oft weniger stark – sie wirken wie ein Stoßdämpfer. Ausnahme: "
+                   "2022 fielen Aktien und Anleihen gleichzeitig.", "bonds"))
+    checks.append((gold > 0.02, "Gold",
+                   f"{pc(gold, 0)} in Gold/Rohstoffen." if gold > 0.02 else
+                   "Du hast **kein Gold**. Gold bringt keine Zinsen, bewegt sich aber oft unabhängig von Aktien und "
+                   "war in Krisen häufig gefragt. Viele Anleger beimischen 5–10 %.", "gold"))
+    sec_ok = top_sec_w <= 0.4
+    checks.append((sec_ok, "Branchen-Streuung",
+                   "Kein Sektor dominiert deine Einzelaktien." if sec_ok else
+                   f"**{pc(top_sec_w, 0)} deines Geldes stecken im Sektor {top_sec}.** Läuft diese Branche schlecht "
+                   "(z. B. Tech 2022: −30 % und mehr), trifft es fast dein ganzes Portfolio."
+                   + (" Gerade Tech-Aktien sind hoch bewertet und schwanken stark." if top_sec == "Technologie" else ""),
+                   "defensive"))
+    c_ok = top_c_w <= 0.7 or broad > 0.3
+    checks.append((c_ok, "Länder-Streuung",
+                   "Deine Einzelaktien sind auf mehrere Länder verteilt oder du hast breite ETFs." if c_ok else
+                   f"**{pc(top_c_w, 0)} deines Geldes stecken in Unternehmen aus {top_c}.** Läuft dieses Land "
+                   "schlecht, gibt es keinen Ausgleich.", "intl"))
+    n_ok = len(assets) >= 8 or broad > 0.3
+    checks.append((n_ok, "Anzahl & Breite",
+                   "Du hast genug Werte oder einen breiten ETF als Basis." if n_ok else
+                   (f"Du hast nur **{len(assets)} Wertpapiere**, und dein breiter ETF macht nur {pc(broad, 0)} aus. "
+                    if broad > 0 else f"Du hast nur **{len(assets)} Wertpapiere** und keinen breiten ETF. ")
+                   + "Ein Welt-ETF als Basis (z. B. 30–60 %) streut auf über 1.000 Unternehmen.", "broad"))
+    checks.append((avg_c <= 0.6, "Gegenseitige Absicherung",
+                   f"Deine Werte laufen ausreichend unterschiedlich (Ø Korrelation {de(avg_c, 2)})." if avg_c <= 0.6 else
+                   f"Deine Werte bewegen sich **stark im Gleichschritt** (Ø Korrelation {de(avg_c, 2)}). In einem "
+                   "Crash fallen sie wahrscheinlich gemeinsam.", "bonds" if bonds <= 0.05 else "gold"))
+
+    st.subheader("Portfolio-Check", help="Sechs Prüfpunkte für ein robustes Portfolio. Grün = in Ordnung, "
+                                         "Gelb = hier könntest du nachbessern.")
+    for ok, title, text, _ in checks:
+        (st.success if ok else st.warning)(f"**{title}:** {text}", icon=":material/check_circle:" if ok else ":material/warning:")
+
+    todo = list(dict.fromkeys(key for ok, _, _, key in checks if not ok))
+    rp_c = R.values @ cur
+    if todo:
+        st.subheader("Ideen zum Ergänzen – durchgerechnet",
+                     help="Für jede Idee rechnet die App mit deinen echten Kursdaten: Was wäre passiert, wenn 10 % deines "
+                          "Portfolios in diesem Wertpapier gesteckt hätten? Nur der gemeinsame Zeitraum zählt.")
+        titles = {"bonds": "Anleihen als Stoßdämpfer", "gold": "Gold als Krisenschutz",
+                  "defensive": "Defensive Branchen gegen den Sektor-Klumpen", "intl": "Andere Länder und Regionen",
+                  "broad": "Breiter Welt-ETF als Basis"}
+        held = set(assets)
+        for key in todo:
+            st.markdown(f"#### {titles[key]}")
+            rows, btns = [], []
+            for sym, nm in CAND[key]:
+                if sym in held:
+                    continue
+                with st.spinner(f"Teste {nm} …"):
+                    res = test_candidate(sym, R, rp_c, rf)
+                if res is None:
+                    rows.append({"Idee": nm, "Ticker": sym, "Zusammenhang mit deinem Portfolio": "keine Daten",
+                                 "Schwankung mit 10 %": "–", "Schlimmster Absturz mit 10 %": "–", "Gewinn pro Risiko mit 10 %": "–"})
+                    continue
+                m0, m1 = res["m0"], res["m1"]
+                rows.append({"Idee": nm, "Ticker": sym, "Zusammenhang mit deinem Portfolio": de(res["corr"], 2),
+                             "Schwankung mit 10 %": f"{pc(m0['Vol. p.a.'])} → {pc(m1['Vol. p.a.'])}",
+                             "Schlimmster Absturz mit 10 %": f"−{pc(m0['Max. Drawdown'], 0)} → −{pc(m1['Max. Drawdown'], 0)}",
+                             "Gewinn pro Risiko mit 10 %": f"{de(m0['Sharpe'], 2)} → {de(m1['Sharpe'], 2)}"})
+                btns.append((sym, nm, m1["Vol. p.a."] < m0["Vol. p.a."]))
+            H = st.column_config.TextColumn
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
+                "Zusammenhang mit deinem Portfolio": H(help="Korrelation von −1 bis +1. Je niedriger, desto besser "
+                                                            "sichert die Idee dein bisheriges Portfolio ab."),
+                "Schwankung mit 10 %": H(help="Schwankung deines Portfolios vorher → mit 10 % Beimischung."),
+                "Schlimmster Absturz mit 10 %": H(help="Größter Einbruch vorher → mit 10 % Beimischung."),
+                "Gewinn pro Risiko mit 10 %": H(help="Sharpe Ratio vorher → mit 10 % Beimischung. Höher ist besser."),
+            })
+            bc = st.columns(max(1, len(btns)))
+            for col, (sym, nm, calmer) in zip(bc, btns):
+                col.button(f"{nm.split(' (')[0]} testen", key=f"add_{key}_{sym}", on_click=add_test, args=(sym, nm),
+                           help="Fügt den Wert mit 0 € zu deiner Auswahl hinzu. Der Optimierer entscheidet dann, "
+                                "wie viel er ihm geben würde.")
+        explain(["„Zusammenhang“ nahe 0 oder negativ heißt: Die Idee bewegt sich anders als dein Portfolio und kann "
+                 "Verluste abfedern. Genau das ist der Sinn einer Beimischung.",
+                 "Achte vor allem darauf, ob **Schwankung und schlimmster Absturz sinken**. Ein kleiner Verlust an "
+                 "Rendite ist oft ein fairer Preis für deutlich mehr Ruhe.",
+                 "Über „testen“ kommt der Wert mit 0 € in deine Auswahl. Auf **Übersicht & Vorschlag** und im "
+                 "**Realitäts-Check** siehst du dann, wie viel der Optimierer hineinstecken würde – und ob es "
+                 "ohne Blick in die Zukunft geholfen hätte."])
+    else:
+        st.success("Dein Portfolio besteht alle Prüfpunkte. Du bist breit aufgestellt.")
+
+    # Ähnliche Alternativen
+    stocks = [j for j, t in enumerate(assets) if cls[j] == "Einzelaktie" and infos[t].get("sector") in PEERS]
+    st.subheader("Ähnliche Alternativen zu deinen Aktien",
+                 help="Für jede Einzelaktie bekannte Unternehmen aus derselben Branche, im selben Zeitraum verglichen. "
+                      "Ein besserer Wert in der Vergangenheit ist keine Garantie für die Zukunft.")
+    if not stocks:
+        st.caption("Keine Einzelaktien mit bekannter Branche in deiner Auswahl.")
+    for j in stocks:
+        t = assets[j]
+        sector = infos[t]["sector"]
+        own = metrics(R[t].values, rf)
+        with st.expander(f"{names[j]} – Branche {SECTOR_DE.get(sector, sector)} (Gewinn pro Risiko {de(own['Sharpe'], 2)})",
+                         expanded=own["Sharpe"] < 0.3):
+            rows, better = [{"Wertpapier": f"{names[j]} (deins)", "Ø Gewinn/Jahr": pc(own["Rendite p.a."]),
+                             "Schwankung": pc(own["Vol. p.a."]), "Schlimmster Absturz": "−" + pc(own["Max. Drawdown"], 0),
+                             "Gewinn pro Risiko": de(own["Sharpe"], 2), "Ähnlichkeit": "–"}], []
+            for sym, nm in PEERS[sector]:
+                if sym in assets:
+                    continue
+                s = load(sym, start, end)
+                if s is None:
+                    continue
+                r = s.pct_change().dropna().reindex(R.index).dropna()
+                if len(r) < 24:
+                    continue
+                m = metrics(r.values, rf)
+                corr = float(np.corrcoef(R[t].loc[r.index].values, r.values)[0, 1])
+                rows.append({"Wertpapier": nm, "Ø Gewinn/Jahr": pc(m["Rendite p.a."]), "Schwankung": pc(m["Vol. p.a."]),
+                             "Schlimmster Absturz": "−" + pc(m["Max. Drawdown"], 0), "Gewinn pro Risiko": de(m["Sharpe"], 2),
+                             "Ähnlichkeit": de(corr, 2)})
+                if m["Sharpe"] > own["Sharpe"] + 0.15:
+                    better.append((sym, nm, m))
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
+                "Ähnlichkeit": st.column_config.TextColumn(help="Korrelation mit deiner Aktie. Nahe 1 = verhält sich "
+                                                                "sehr ähnlich, wäre also ein echter Ersatz.")})
+            if better:
+                st.markdown("**Historisch besseres Verhältnis von Gewinn zu Risiko:** " +
+                            ", ".join(f"{nm} ({de(m['Sharpe'], 2)})" for _, nm, m in better))
+                bc = st.columns(len(better))
+                for col, (sym, nm, _) in zip(bc, better):
+                    col.button(f"{nm} testen", key=f"peer_{t}_{sym}", on_click=add_test, args=(sym, nm))
+            else:
+                st.caption(f"Keine der Vergleichsaktien war im selben Zeitraum klar besser als {names[j]}.")
+    if stocks:
+        explain(["Die Vergleichsaktien stammen aus derselben Branche. Eine hohe **Ähnlichkeit** heißt, sie verhalten "
+                 "sich ähnlich wie deine Aktie und wären ein echter Ersatz. Eine niedrige Ähnlichkeit heißt, sie würden "
+                 "zusätzlich streuen.",
+                 "Wichtig: Dass eine Aktie in der Vergangenheit besser lief, sagt wenig über die Zukunft. Tausche nicht "
+                 "nur wegen dieser Tabelle – schau dir auch die **Unternehmensdaten** (KGV, Wachstum) an."])
+
+
+# =====================================================================
+# Seite: Nachrichten
+# =====================================================================
+def news_cards(items, show_t=True):
+    if not items:
+        st.caption("Keine Nachrichten gefunden.")
+        return
+    for it in items:
+        with st.container(border=True):
+            ttl = it["title"].replace("[", "(").replace("]", ")")
+            st.markdown(f"##### [{ttl}]({it['url']})")
+            meta = [it["prov"] or "Quelle unbekannt"]
+            if it["ts"] is not None and it["ts"] == it["ts"]:
+                meta.append(it["ts"].tz_convert("Europe/Berlin").strftime("%d.%m.%Y, %H:%M Uhr"))
+            if show_t:
+                meta.append(label(it["t"]))
+            st.caption(" · ".join(meta))
+            if it["summary"]:
+                st.write(it["summary"] + ("…" if len(it["summary"]) >= 320 else ""))
+
+
+def merge_news(tickers, n):
+    seen, out = set(), []
+    for t in tickers:
+        for it in get_news(t, n):
+            if it["url"] not in seen:
+                seen.add(it["url"])
+                out.append(it)
+    epoch = pd.Timestamp(0, tz="UTC")
+    return sorted(out, key=lambda x: x["ts"] if x["ts"] is not None and x["ts"] == x["ts"] else epoch, reverse=True)
+
+
+def page_news():
+    head("Nachrichten", "Aktuelle Börsennachrichten – allgemein und zu deinen Wertpapieren. Die Meldungen kommen "
+                        "über Yahoo Finance und sind meist auf Englisch.",
+         "Die Nachrichten werden alle 30 Minuten neu geladen. Ein Klick auf die Überschrift öffnet den Artikel beim "
+         "Anbieter.")
+    t1, t2 = st.tabs(["Markt allgemein", "Zu deinen Wertpapieren"])
+    with t1:
+        with st.spinner("Lade Marktnachrichten …"):
+            items = merge_news(["^GSPC", "^GDAXI", "^IXIC", "^STOXX50E"], 8)
+        news_cards(items[:25], show_t=False)
+    with t2:
+        sel = list(dict.fromkeys(ss.sel))
+        pick = st.multiselect("Nur Nachrichten zu", sel, default=sel, format_func=label, key="news_pick",
+                              help="Wähle, zu welchen deiner Wertpapiere du Nachrichten sehen willst.")
+        with st.spinner("Lade Nachrichten zu deinen Wertpapieren …"):
+            items = merge_news(pick, 6)
+        news_cards(items[:40])
+    st.caption("Nachrichten sind keine Handlungsempfehlung. Kurzfristige Meldungen sagen wenig über die langfristige "
+               "Entwicklung eines Unternehmens.")
+
+
+# =====================================================================
 # Menü
 # =====================================================================
 P_INPUT = st.Page(page_input, title="Mein Portfolio", icon=":material/edit:", url_path="portfolio", default=True)
@@ -1107,9 +1667,13 @@ P_FRONT = st.Page(page_frontier, title="Efficient Frontier", icon=":material/sca
 P_STYLE = st.Page(page_style, title="Style Analysis", icon=":material/stacked_line_chart:", url_path="style")
 P_COMP = st.Page(page_compare, title="Strategievergleich", icon=":material/table_chart:", url_path="vergleich")
 P_HELP = st.Page(page_help, title="Begriffe & Hilfe", icon=":material/help:", url_path="hilfe")
+P_INFO = st.Page(page_info, title="Unternehmensdaten", icon=":material/apartment:", url_path="unternehmensdaten")
+P_IMPROVE = st.Page(page_improve, title="Portfolio verbessern", icon=":material/lightbulb:", url_path="verbessern")
+P_NEWS = st.Page(page_news, title="Nachrichten", icon=":material/newspaper:", url_path="nachrichten")
 
 menu = {"Start": [P_INPUT, P_OVER],
-        "Simulationen & Analysen": [P_GROWTH, P_ASSETS, P_RISK, P_FUTURE, P_CHECK]}
+        "Simulationen & Analysen": [P_GROWTH, P_ASSETS, P_RISK, P_FUTURE, P_CHECK],
+        "Infos & Ideen": [P_IMPROVE, P_INFO, P_NEWS]}
 if expert:
     menu["Experten"] = [P_FRONT, P_STYLE, P_COMP]
 menu["Hilfe"] = [P_HELP]
