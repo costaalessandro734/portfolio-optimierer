@@ -733,10 +733,12 @@ sb.radio("Dein Ziel", goal_opts, key="goal",
          help="Ruhig: geringste Schwankung, schaut nicht auf Gewinne und ist daher am robustesten. Bestes "
               "Verhältnis: maximiert die Sharpe Ratio, reagiert aber stark auf Zufälle in den Vergangenheitsdaten. "
               "Gleichmäßig: jedes Wertpapier gleich viel. Benchmark: Mischung, die einen Index nachbildet.")
-years = sb.slider("Jahre zurückschauen", 3, 25, 10, key="years",
+ss.setdefault("years", 10)
+ss.setdefault("hor", 5)
+years = sb.slider("Jahre zurückschauen", 3, 25, key="years",
                   help="So viele Jahre Kursgeschichte werden ausgewertet. Mehr Jahre = mehr Erfahrung, aber sehr "
                        "alte Daten sagen weniger über heute aus.")
-hor = sb.slider("Anlagedauer (Jahre)", 1, 30, 5, key="hor",
+hor = sb.slider("Anlagedauer (Jahre)", 1, 30, key="hor",
                 help="Für diesen Zeitraum wird simuliert, was aus deinem Geld werden könnte.")
 start, end = date.today() - timedelta(days=365 * years), date.today()
 rf, n_mc, split, win, bench_t, uploads = 0.02, 3000, 70, 36, "", None
