@@ -78,6 +78,7 @@ ss.setdefault("prefer_de", True)
 ss.setdefault("replace_sel", True)
 ss.setdefault("sel", [POPULAR[n] for n in ["Apple", "Microsoft", "iShares MSCI World ETF", "Allianz", "Coca-Cola"]])
 ss.setdefault("tr_map", {})       # ISIN -> Yahoo-Ticker (Trade-Republic-Import)
+ss.setdefault("tr_crypto_in", True)
 ss.setdefault("pos", {})          # Ticker -> {"qty", "cost", "date"}
 ss.setdefault("input_mode", "Einfach: nur Betrag in €")
 ss.setdefault("tax", 26.4)
@@ -89,7 +90,7 @@ for k, v in {"sp_rate": 200.0, "sp_years": 20, "sp_goal": 100000.0, "sp_dyn": 0,
     ss.setdefault(k, v)
 for k in ("sel", "bulk", "prefer_de", "replace_sel", "q", "input_mode", "tax", "newmoney", "nosell", "sp_rate",
           "sp_years", "sp_goal", "sp_dyn", "sp_infl", "sp_start", "wd_rate", "wd_years", "wd_infl", "wd_start",
-          "rep_stress", "sp_port", "wd_port", "bm_choice", "stress_pick"):      # Widgets auf anderen Seiten nicht vergessen
+          "rep_stress", "sp_port", "wd_port", "bm_choice", "stress_pick", "tr_crypto_in"):      # Widgets auf anderen Seiten nicht vergessen
     if k in ss:
         ss[k] = ss[k]
 
@@ -592,7 +593,7 @@ def get_ctx():
         except Exception as e:
             st.warning(f"{f.name} konnte nicht gelesen werden: {e}")
     assets = [t for t in tickers if t in series and t != bench]
-    ctx = dict(failed=failed, assets=assets, bench=bench, series=series)
+    ctx = dict(failed=failed, assets=assets, all_assets=list(assets), bench=bench, series=series)
     if len(assets) < 2:
         return ctx | {"err": "Wähle auf der Seite **Mein Portfolio** mindestens 2 Wertpapiere aus."}
     young = []
@@ -662,6 +663,40 @@ def page_input():
     head("Mein Portfolio", "Trag ein, welche Aktien oder ETFs du hast und wie viel Geld jeweils darin steckt. "
                            "Danach findest du links im Menü alle Auswertungen und Simulationen.")
     st.header("1. Welche Wertpapiere hast du?")
+    with st.container(border=True):
+        st.markdown("**Dein Trade-Republic-Depot verwenden**")
+        if ss.get("tr"):
+            hold = ss.tr["hold"]
+            n_c = int((hold["cls"] == "CRYPTO").sum()) if len(hold) else 0
+            st.caption(f"Geladener Export: {len(hold)} offene Positionen ({len(hold) - n_c} Wertpapiere, {n_c} Krypto).")
+            cc1, cc2 = st.columns([2, 3])
+            cc1.checkbox("Krypto einbeziehen", key="tr_crypto_in",
+                         help="Aus: Nur Aktien, ETFs und Fonds werden in die Simulationen übernommen.")
+            cc2.button("Trade-Republic-Depot übernehmen", type="primary", icon=":material/move_down:",
+                       on_click=tr_take_over, width="stretch",
+                       help="Ersetzt die Auswahl unten durch alle offenen Positionen aus deinem Export – mit Stückzahl, "
+                            "Ø Kaufkurs und Kaufdatum. Danach rechnen alle Seiten mit deinem echten Depot.")
+        else:
+            st.caption("Lade deinen Transaktionsexport (CSV aus der Trade Republic App) hoch – das Depot wird sofort "
+                       "übernommen.")
+            st.checkbox("Krypto einbeziehen", key="tr_crypto_in")
+            st.file_uploader("Trade-Republic-CSV", type=["csv"], key="tr_file_input", on_change=tr_take_over,
+                             kwargs={"from_upload": True}, label_visibility="collapsed",
+                             help="Trade Republic App → Profil → Einstellungen/Dokumente → Transaktionsexport (CSV).")
+        msg = ss.pop("take_msg", None)
+        if msg and msg[0] == "ok":
+            st.success(f"**{msg[1]} Positionen übernommen.** Stückzahlen, Kaufkurse und Kaufdaten stehen unten in Schritt 2. "
+                       "Alle Seiten im Menü rechnen jetzt mit deinem Trade-Republic-Depot.")
+            if msg[2]:
+                st.warning("Ohne aktuellen Kurs, deshalb nicht übernommen: " + ", ".join(msg[2]) + ". Den Yahoo-Ticker "
+                           "kannst du auf der Seite **Trade-Republic-Import** im Reiter „Zuordnung der Kurse“ eintragen "
+                           "und dann erneut übernehmen.")
+            if msg[3]:
+                st.caption("Krypto nicht übernommen: " + ", ".join(msg[3]))
+        elif msg and msg[0] == "err":
+            st.error(msg[1])
+        st.page_link(P_TR, label="Vermögen, Gewinne und Zahlungen ansehen (Trade-Republic-Import)",
+                     icon=":material/upload_file:")
     c1, c2 = st.columns(2, gap="large")
     with c1:
         q = st.text_input("Wertpapier suchen", key="q",
@@ -706,7 +741,7 @@ def page_input():
     c = get_ctx()
     if c["failed"]:
         st.warning("Für **" + ", ".join(c["failed"]) + "** wurden keine Kurse gefunden. Prüfe die Auswahl.")
-    assets = c["assets"]
+    assets = c.get("all_assets", c["assets"])
     if len(assets) < 1:
         st.info("Füge oben Wertpapiere hinzu.")
         return
@@ -2959,6 +2994,28 @@ def tr_valuation(tr):
     return pd.DataFrame(rows)
 
 
+def tr_take_over(from_upload=False):
+    """Callback: (optional Datei einlesen,) Kurse suchen und das Depot in „Mein Portfolio“ übernehmen."""
+    if from_upload:
+        f = ss.get("tr_file_input")
+        if f is None:
+            return
+        try:
+            ss.tr = analyse_tr(read_tr_csv(f.getvalue()))
+            ss.tr_err, ss.tr_map = None, {}
+        except Exception as e:
+            ss.tr, ss.tr_err = None, str(e)
+            ss.take_msg = ("err", str(e))
+            return
+    if not ss.get("tr"):
+        return
+    v = tr_valuation(ss.tr)
+    tr_apply(v, ss.get("tr_crypto_in", True))
+    miss = v[v["price"].isna()]["name"].tolist()
+    skipped = v[v["krypto"]]["name"].tolist() if not ss.get("tr_crypto_in", True) else []
+    ss.take_msg = ("ok", ss.tr_applied, miss, skipped)
+
+
 def tr_apply(v, with_crypto):
     use = v[v["price"].notna() & (with_crypto | ~v["krypto"])]
     ss.sel = list(dict.fromkeys(use["ticker"]))
@@ -2970,7 +3027,7 @@ def tr_apply(v, with_crypto):
                       "date": first.date() if pd.notna(first) else None}
     ss.input_mode = "Genau: Stückzahl & Kaufkurs"
     ss.imp += 1
-    ss.tr_applied = len(use)
+    ss.tr_applied = ss.sel.__len__()
 
 
 def pos_table(d):
