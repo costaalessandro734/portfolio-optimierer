@@ -38,11 +38,12 @@ button[data-baseweb="tab"] p { font-size: 1.1rem; }
 # Deutsche Zahlenformate
 # =====================================================================
 def de(x, d=1):
-    return f"{x:,.{d}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{x:,.{d}f}".replace(",", "X").replace(".", ",").replace("X", ".").replace("-", "−")
 
 
 def sg(x, d=1):
-    return ("+" if x > 0 else "") + de(x, d)
+    """Mit Vorzeichen; ASCII-Minus, damit Streamlit-Kennzahlen die Richtung (Pfeil/Farbe) richtig erkennen."""
+    return ("+" if x > 0 else "") + de(x, d).replace("−", "-")
 
 
 def eur(x):
@@ -81,7 +82,13 @@ ss.setdefault("input_mode", "Einfach: nur Betrag in €")
 ss.setdefault("tax", 26.4)
 ss.setdefault("newmoney", 0.0)
 ss.setdefault("nosell", False)
-for k in ("sel", "bulk", "prefer_de", "replace_sel", "q", "input_mode", "tax", "newmoney", "nosell"):      # Widgets auf anderen Seiten nicht vergessen
+for k, v in {"sp_rate": 200.0, "sp_years": 20, "sp_goal": 100000.0, "sp_dyn": 0, "sp_infl": False,
+             "wd_years": 25, "wd_infl": True, "rep_stress": True,
+             "sp_port": "Mein jetziges Portfolio", "wd_port": "Mein jetziges Portfolio"}.items():
+    ss.setdefault(k, v)
+for k in ("sel", "bulk", "prefer_de", "replace_sel", "q", "input_mode", "tax", "newmoney", "nosell", "sp_rate",
+          "sp_years", "sp_goal", "sp_dyn", "sp_infl", "sp_start", "wd_rate", "wd_years", "wd_infl", "wd_start",
+          "rep_stress", "sp_port", "wd_port", "bm_choice", "stress_pick"):      # Widgets auf anderen Seiten nicht vergessen
     if k in ss:
         ss[k] = ss[k]
 
@@ -476,7 +483,8 @@ def head(title, intro, help_txt=None):
 # =====================================================================
 # Speichern & Laden
 # =====================================================================
-SAVE_KEYS = ("sel", "names", "amounts", "bounds", "input_mode", "goal", "years", "hor", "tax", "expert", "bench")
+SAVE_KEYS = ("sel", "names", "amounts", "bounds", "input_mode", "goal", "years", "hor", "tax", "expert", "bench",
+             "newmoney", "nosell", "sp_start", "sp_rate", "sp_years", "sp_goal", "sp_dyn", "sp_infl", "wd_start", "wd_rate", "wd_years", "wd_infl", "bm_choice")
 
 
 def state_to_json():
@@ -496,7 +504,8 @@ def apply_load():
         data = json.loads(f.getvalue().decode("utf-8"))
         if data.get("app") != "Portfolio-Check":
             raise ValueError("Das ist keine gespeicherte Portfolio-Check-Datei.")
-        for k in ("sel", "names", "amounts", "input_mode", "tax", "expert", "bench", "years", "hor"):
+        for k in ("sel", "names", "amounts", "input_mode", "tax", "expert", "bench", "years", "hor",
+                  "newmoney", "nosell", "sp_start", "sp_rate", "sp_years", "sp_goal", "sp_dyn", "sp_infl", "wd_start", "wd_rate", "wd_years", "wd_infl", "bm_choice"):
             if k in data and data[k] is not None:
                 ss[k] = data[k]
         if data.get("goal") in GOALS:
@@ -2022,6 +2031,678 @@ def page_news():
 
 
 # =====================================================================
+# Planen & Testen – gemeinsame Helfer
+# =====================================================================
+LONG_START = date(1999, 1, 1)
+CRISES = [("Dotcom-Crash", "2000-03", "2002-09", "Platzen der Internet-Blase: Technologie-Aktien verloren teils über 80 %."),
+          ("Finanzkrise", "2007-10", "2009-02", "US-Immobilienblase und Lehman-Pleite: weltweiter Bankencrash."),
+          ("Euro-Schuldenkrise", "2011-04", "2011-09", "Angst um Griechenland, Italien und den Euro."),
+          ("Corona-Crash", "2020-01", "2020-03", "Pandemie-Schock: der schnellste Absturz der Geschichte."),
+          ("Zinswende 2022", "2021-12", "2022-09", "Hohe Inflation, stark steigende Zinsen: Aktien UND Anleihen fielen.")]
+BENCHES = {"MSCI World (iShares, EUNL.DE)": "EUNL.DE", "S&P 500 (iShares, SXR8.DE)": "SXR8.DE",
+           "DAX (^GDAXI)": "^GDAXI", "Gold (Xetra-Gold, 4GLD.DE)": "4GLD.DE"}
+
+
+def long_returns(tickers):
+    """Monatsrenditen mit möglichst langer Historie (ab 1999), Lücken bleiben NaN."""
+    ser = {}
+    for t in tickers:
+        s = load(t, LONG_START, date.today())
+        if s is not None:
+            ser[t] = s
+    if not ser:
+        return pd.DataFrame()
+    return pd.concat(ser, axis=1).sort_index().pct_change(fill_method=None)
+
+
+def boot_paths(rp, months, n=2000, seed=21):
+    rp = np.asarray(rp)
+    return rp[np.random.default_rng(seed).integers(0, len(rp), (n, months))]
+
+
+def port_choice(c, key):
+    opts = {"Mein jetziges Portfolio": c["cur"], "Der Vorschlag": c["tw"]}
+    ch = st.radio("Mit welcher Aufteilung rechnen?", list(opts), key=key, horizontal=True,
+                  help="Die Simulation zieht zufällig echte Monatsrenditen aus dem ausgewerteten Zeitraum – entweder "
+                       "mit deiner heutigen Aufteilung oder mit der vorgeschlagenen.")
+    return ch, c["R"].values @ opts[ch]
+
+
+# =====================================================================
+# Seite: Krisen-Stresstest
+# =====================================================================
+def page_stress():
+    c = ready()
+    assets, names, cur, tw, V = c["assets"], c["names"], c["cur"], c["tw"], c["V"]
+    head("Krisen-Stresstest", "Wie hätte dein heutiges Depot die großen Börsencrashs der letzten 25 Jahre überstanden? "
+                              "Die App spielt deine Aufteilung mit den echten Kursen von damals durch.",
+         "Gerechnet wird mit Monatsdaten und deiner heutigen Aufteilung (monatlich auf diese Gewichte zurückgesetzt). "
+         "Wertpapiere, die es damals noch nicht gab, werden weggelassen; die übrigen werden hochgerechnet. Innerhalb eines "
+         "Monats können die echten Tiefs noch tiefer gewesen sein.")
+    with st.spinner("Lade lange Kurshistorie (einmalig etwas langsamer) …"):
+        RL = long_returns(assets + ["^GSPC"])
+    if RL.empty:
+        st.warning("Es konnte keine lange Kurshistorie geladen werden.")
+        return
+    rows, paths = [], {}
+    for name, a, b, desc in CRISES:
+        win_ = RL.loc[(RL.index > pd.Period(a, "M")) & (RL.index <= pd.Period(b, "M"))]
+        if win_.empty:
+            continue
+        avail = [i for i, t in enumerate(assets) if t in win_ and win_[t].notna().all()]
+        res = {"Krise": name, "Zeitraum": f"{pd.Period(a, 'M').strftime('%m/%Y')} – {pd.Period(b, 'M').strftime('%m/%Y')}",
+               "desc": desc}
+        for lab, w in (("Dein Depot", cur), ("Vorschlag", tw)):
+            ww = np.array([w[i] for i in avail])
+            cov = ww.sum()
+            if not avail or cov < 0.3:
+                res[lab], res[lab + " cov"] = None, cov
+                continue
+            rp = win_[[assets[i] for i in avail]].values @ (ww / cov)
+            path = np.cumprod(1 + rp)
+            res[lab], res[lab + " cov"], res[lab + " dd"] = path[-1] - 1, cov, (path / np.maximum.accumulate(path) - 1).min()
+            # Erholung: wie viele Monate nach dem Tief bis zum alten Stand?
+            after = RL.loc[RL.index > pd.Period(b, "M"), [assets[i] for i in avail]].dropna()
+            lvl, rec = path[-1], None
+            for k_, r_ in enumerate(after.values @ (ww / cov)):
+                lvl *= 1 + r_
+                if lvl >= 1:
+                    rec = k_ + 1
+                    break
+            res[lab + " rec"] = rec
+            if lab == "Dein Depot":
+                paths[name] = (win_.index, path)
+        g = win_["^GSPC"] if "^GSPC" in win_ else None
+        res["S&P 500"] = (np.prod(1 + g.values) - 1) if g is not None and g.notna().all() else None
+        rows.append(res)
+    if not rows:
+        st.info("Für keine der Krisen gibt es genug Kursdaten zu deinen Wertpapieren.")
+        return
+    st.subheader("Verlust in jeder Krise", help="Wie viel dein Depot vom Beginn bis zum Tiefpunkt der Krise verloren "
+                                                "hätte. Zum Vergleich der US-Aktienmarkt (S&P 500).")
+    fg = go.Figure()
+    for lab, col in (("Dein Depot", "#e8361b"), ("Vorschlag", "#1240e0"), ("S&P 500", "#999")):
+        fg.add_bar(x=[r["Krise"] for r in rows], y=[r.get(lab) for r in rows], name=lab, marker_color=col,
+                   text=[pc(r[lab], 0) if r.get(lab) is not None else "keine Daten" for r in rows], textposition="outside")
+    fg.update_layout(barmode="group", height=480, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
+                     legend=dict(orientation="h", y=1.1), font=dict(size=15), separators=",.")
+    st.plotly_chart(fg, width="stretch")
+    TC = st.column_config.TextColumn
+    st.dataframe(pd.DataFrame([{
+        "Krise": r["Krise"], "Zeitraum": r["Zeitraum"],
+        "Dein Depot": pc(r["Dein Depot"], 0) if r["Dein Depot"] is not None else "keine Daten",
+        "in €": (("−" if r["Dein Depot"] < 0 else "+") + eur(abs(r["Dein Depot"]) * V)) if r["Dein Depot"] is not None else "–",
+        "Erholung": (f"{r['Dein Depot rec']} Monate" if r.get("Dein Depot rec") else "nicht erreicht")
+        if r["Dein Depot"] is not None else "–",
+        "Abgedeckt": pc(r["Dein Depot cov"], 0),
+        "Vorschlag": pc(r["Vorschlag"], 0) if r["Vorschlag"] is not None else "–",
+        "S&P 500": pc(r["S&P 500"], 0) if r["S&P 500"] is not None else "–"} for r in rows]),
+        hide_index=True, width="stretch", column_config={
+            "in €": TC(help="So viel hätte dein heutiges Depot (in heutiger Größe) in dieser Krise verloren."),
+            "Erholung": TC(help="Monate nach dem Tiefpunkt, bis der Wert vor der Krise wieder erreicht war."),
+            "Abgedeckt": TC(help="Welcher Anteil deines Depots damals schon existierte und eingerechnet ist. Unter "
+                                 "100 % ist das Ergebnis eine Hochrechnung.")})
+    st.subheader("Verlauf in einer Krise", help="Wert deines Depots während der gewählten Krise, Start = heutiger Depotwert.")
+    pick = st.selectbox("Krise auswählen", list(paths), key="stress_pick") if paths else None
+    if pick:
+        idx, path = paths[pick]
+        fp = go.Figure(go.Scatter(x=idx.to_timestamp(), y=V * np.r_[path], mode="lines+markers",
+                                  line=dict(color="#e8361b", width=3)))
+        fp.add_hline(y=V, line_dash="dot", line_color="gray", annotation_text="Wert vor der Krise")
+        fp.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€", separators=",.",
+                         font=dict(size=15))
+        st.plotly_chart(fp, width="stretch")
+        st.caption(next(r["desc"] for r in rows if r["Krise"] == pick))
+    valid = [r for r in rows if r["Dein Depot"] is not None]
+    lines = []
+    if valid:
+        worst = min(valid, key=lambda r: r["Dein Depot"])
+        lines.append(f"Am härtesten hätte dich die **{worst['Krise']}** getroffen: **{pc(worst['Dein Depot'], 0)}**, also "
+                     f"etwa **{eur(-worst['Dein Depot'] * V)}** weniger bei deinem heutigen Depot."
+                     + (f" Bis der alte Stand wieder erreicht war, dauerte es {worst['Dein Depot rec']} Monate."
+                        if worst.get("Dein Depot rec") else " Der alte Stand wurde in den Daten nicht wieder erreicht."))
+        cmp_ = [r for r in valid if r["S&P 500"] is not None]
+        if cmp_:
+            better = sum(r["Dein Depot"] > r["S&P 500"] for r in cmp_)
+            lines.append(f"In {better} von {len(cmp_)} Krisen hat dein Depot weniger verloren als der US-Aktienmarkt.")
+        vb = [r for r in valid if r["Vorschlag"] is not None]
+        if vb:
+            avg_d = np.mean([r["Vorschlag"] - r["Dein Depot"] for r in vb])
+            lines.append("Der Vorschlag hätte in den Krisen im Schnitt **" + ("weniger" if avg_d > 0 else "mehr") +
+                         f"** verloren ({sg(avg_d * 100, 0)} Prozentpunkte).")
+        if any(r["Dein Depot cov"] < 0.95 for r in valid):
+            lines.append("Achtung: Bei manchen Krisen gab es einige deiner Wertpapiere noch nicht (siehe „Abgedeckt“). "
+                         "Dort ist das Ergebnis eine Hochrechnung mit den übrigen Werten.")
+    lines.append("Die wichtigste Frage: **Hättest du in so einer Phase durchgehalten, ohne zu verkaufen?** Wer im Crash "
+                 "verkauft, macht Buchverluste endgültig. Wenn dich die Zahlen erschrecken, ist ein ruhigeres Portfolio "
+                 "(z. B. mit Anleihen) besser für dich.")
+    explain(lines)
+
+
+# =====================================================================
+# Seite: Vergleich mit dem Markt
+# =====================================================================
+def page_vs_market():
+    c = ready()
+    assets, names, cur, R, V, T = c["assets"], c["names"], c["cur"], c["R"], c["V"], c["T"]
+    head("Vergleich mit dem Markt", "Hättest du mit einem einfachen ETF mehr oder weniger verdient? Die ehrlichste Frage "
+                                    "für jeden Anleger, der einzelne Aktien auswählt.",
+         "Der Vergleichsindex wird mit Kursen inklusive Dividenden gerechnet (thesaurierende ETFs). Deine Positionen "
+         "seit Kauf werden ohne erhaltene Dividenden gerechnet – bei Dividendenaktien ist dein Ergebnis also etwas besser, "
+         "als hier steht.")
+    bname = st.selectbox("Vergleichen mit", list(BENCHES), key="bm_choice",
+                         help="MSCI World: über 1.500 große Unternehmen aus Industrieländern – der Standard-ETF vieler "
+                              "Anleger. S&P 500: die 500 größten US-Unternehmen. DAX: 40 deutsche Unternehmen.")
+    bt_ = BENCHES[bname]
+    with st.spinner("Lade Vergleichsindex …"):
+        bl = load(bt_, LONG_START, date.today())
+    if bl is None:
+        st.warning(f"Für {bname} konnten keine Kurse geladen werden.")
+        return
+    dep = c["dep"]
+    st.header("Seit deinen Käufen")
+    rows = []
+    if dep is not None:
+        for t, n in zip(assets, names):
+            d_, inv, val = dep.loc[t, "date"], dep.loc[t, "invested"], dep.loc[t, "value"]
+            if not d_ or inv <= 0:
+                continue
+            per = pd.Period(d_, "M")
+            if per not in bl.index:
+                continue
+            mult = float(bl.iloc[-1] / bl.loc[per])
+            rows.append({"t": t, "n": n, "date": d_, "inv": inv, "val": val, "bench": inv * mult})
+    if not rows:
+        st.info("Trag auf **Mein Portfolio** (genaue Eingabe) bei deinen Positionen das **Kaufdatum** und den **Kaufkurs** "
+                "ein. Dann siehst du hier für jede Position, ob ein ETF besser gewesen wäre.")
+    else:
+        df_ = pd.DataFrame(rows)
+        tot_v, tot_b, tot_i = df_["val"].sum(), df_["bench"].sum(), df_["inv"].sum()
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Deine Positionen heute", eur(tot_v), f"{sg((tot_v / tot_i - 1) * 100)} %",
+                  help="Wert heute der Positionen mit Kaufdatum, Veränderung seit Kauf.")
+        k2.metric(f"Mit {bname.split(' (')[0]} wäre es", eur(tot_b), f"{sg((tot_b / tot_i - 1) * 100)} %",
+                  help="Wenn du dasselbe Geld zum selben Zeitpunkt in den Vergleichsindex gesteckt hättest.")
+        k3.metric("Unterschied", ("+" if tot_v >= tot_b else "−") + eur(abs(tot_v - tot_b)),
+                  help="Positiv: Deine Auswahl war besser als der Index. Negativ: Der Index wäre besser gewesen.")
+        st.dataframe(pd.DataFrame({
+            "Wertpapier": df_["n"], "Gekauft": [d.strftime("%d.%m.%Y") for d in df_["date"]],
+            "Investiert": [eur(x) for x in df_["inv"]], "Wert heute": [eur(x) for x in df_["val"]],
+            f"Mit {bname.split(' (')[0]}": [eur(x) for x in df_["bench"]],
+            "Unterschied": [("+" if v >= b else "−") + eur(abs(v - b)) for v, b in zip(df_["val"], df_["bench"])],
+            "Besser?": ["deine Wahl" if v >= b else "der Index" for v, b in zip(df_["val"], df_["bench"])]}),
+            hide_index=True, width="stretch")
+        fg = go.Figure()
+        fg.add_bar(x=df_["n"], y=df_["val"], name="Deine Position", marker_color="#1240e0")
+        fg.add_bar(x=df_["n"], y=df_["bench"], name=f"Mit {bname.split(' (')[0]}", marker_color="#b8c4e8")
+        fg.update_layout(barmode="group", height=420, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€",
+                         separators=",.", legend=dict(orientation="h", y=1.08), font=dict(size=15))
+        st.plotly_chart(fg, width="stretch")
+        wins = int((df_["val"] >= df_["bench"]).sum())
+        explain([f"Mit deinen Positionen hast du **{('mehr' if tot_v >= tot_b else 'weniger')}** verdient als mit dem "
+                 f"{bname.split(' (')[0]}: Unterschied **{('+' if tot_v >= tot_b else '−')}{eur(abs(tot_v - tot_b))}**.",
+                 f"{wins} von {len(df_)} Positionen haben den Index geschlagen.",
+                 "Zur Einordnung: Die meisten Profi-Fonds schaffen es über 10 Jahre nicht, den Markt zu schlagen. Wenn "
+                 "der Index bei dir vorne liegt, bist du in guter Gesellschaft – und ein ETF als Basis könnte dir "
+                 "Arbeit und Risiko sparen."])
+    st.header(f"Im ausgewerteten Zeitraum ({years} Jahre)")
+    br = bl.pct_change().dropna().reindex(R.index)
+    ok_ = br.notna()
+    if ok_.sum() < 24:
+        st.info("Für diesen Zeitraum gibt es zu wenige Kurse des Vergleichsindex.")
+        return
+    rp = (R.values @ cur)[ok_.values]
+    brv = br[ok_].values
+    idx = R.index[ok_.values].to_timestamp()
+    f2 = go.Figure()
+    f2.add_scatter(x=idx, y=V * np.cumprod(1 + rp), name="Dein Depot (heutige Aufteilung)", line=dict(color="#e8361b", width=3))
+    f2.add_scatter(x=idx, y=V * np.cumprod(1 + brv), name=bname.split(" (")[0], line=dict(color="#555", width=3))
+    f2.update_layout(height=460, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€", separators=",.",
+                     legend=dict(orientation="h", y=1.08), hovermode="x unified", font=dict(size=15))
+    st.plotly_chart(f2, width="stretch")
+    m_p, m_b = metrics(rp, rf), metrics(brv, rf)
+    st.dataframe(pd.DataFrame({"": ["Dein Depot", bname.split(" (")[0]],
+                               "Ø Gewinn/Jahr": [pc(m_p["Rendite p.a."]), pc(m_b["Rendite p.a."])],
+                               "Schwankung": [pc(m_p["Vol. p.a."]), pc(m_b["Vol. p.a."])],
+                               "Schlimmster Absturz": ["−" + pc(m_p["Max. Drawdown"]), "−" + pc(m_b["Max. Drawdown"])],
+                               "Gewinn pro Risiko": [de(m_p["Sharpe"], 2), de(m_b["Sharpe"], 2)]}),
+                 hide_index=True, width="stretch")
+    corr = float(np.corrcoef(rp, brv)[0, 1])
+    explain([f"Mit deiner heutigen Aufteilung wärst du im Schnitt **{pc(m_p['Rendite p.a.'])}** pro Jahr gewachsen, der "
+             f"{bname.split(' (')[0]} **{pc(m_b['Rendite p.a.'])}** – bei {pc(m_p['Vol. p.a.'])} gegenüber "
+             f"{pc(m_b['Vol. p.a.'])} Schwankung.",
+             "Dein Depot hatte " + ("ein **besseres**" if m_p["Sharpe"] > m_b["Sharpe"] + 0.05 else "ein **schlechteres**"
+                                    if m_p["Sharpe"] < m_b["Sharpe"] - 0.05 else "ein ähnliches")
+             + f" Verhältnis von Gewinn zu Risiko ({de(m_p['Sharpe'], 2)} gegenüber {de(m_b['Sharpe'], 2)}).",
+             f"Ähnlichkeit zum Index: {de(corr, 2)}. " + ("Dein Depot verhält sich fast wie der Index – dann bietet ein "
+                                                          "günstiger ETF dasselbe mit weniger Aufwand." if corr > 0.85 else
+                                                          "Dein Depot verhält sich deutlich anders als der Index.")])
+
+
+# =====================================================================
+# Seite: Sparplan-Rechner
+# =====================================================================
+def fan(x, P, name, col, rgba):
+    p5, p50, p95 = np.percentile(P, [5, 50, 95], axis=0)
+    return [go.Scatter(x=np.r_[x, x[::-1]], y=np.r_[p95, p5[::-1]], fill="toself", fillcolor=rgba, line=dict(width=0),
+                       name=name + " (9 von 10 Fällen)", hoverinfo="skip"),
+            go.Scatter(x=x, y=p50, name=name + " (mittlerer Fall)", line=dict(color=col, width=3))]
+
+
+def page_savings():
+    c = ready()
+    head("Sparplan-Rechner", "Wie viel wird aus deinem Depot, wenn du jeden Monat etwas dazu sparst – und wann "
+                             "erreichst du dein Ziel?",
+         "2000 Simulationen mit echten Monatsrenditen deiner Aufteilung (Bootstrap). Die Rate wird jeweils am "
+         "Monatsanfang investiert.")
+    ch, rp = port_choice(c, "sp_port")
+    a1, a2, a3 = st.columns(3)
+    ss.setdefault("sp_start", float(round(c["V"], -1)))
+    start_v = a1.number_input("Startkapital (€)", min_value=0.0, step=500.0, key="sp_start",
+                              help="Womit du startest – voreingestellt ist dein heutiger Depotwert.")
+    rate = a2.number_input("Monatliche Sparrate (€)", min_value=0.0, step=25.0, key="sp_rate",
+                           help="Wie viel du jeden Monat dazu investierst.")
+    yrs = a3.slider("Wie viele Jahre?", 1, 40, key="sp_years", help="Wie lange du sparst.")
+    b1, b2, b3 = st.columns(3)
+    goal_v = b1.number_input("Dein Ziel (€)", min_value=0.0, step=5000.0, key="sp_goal",
+                             help="Welche Summe willst du erreichen? Die App rechnet aus, wie wahrscheinlich das ist.")
+    dyn = b2.slider("Sparrate steigt jedes Jahr um (%)", 0, 10, key="sp_dyn",
+                    help="Dynamik: Wenn dein Einkommen steigt, kannst du die Rate jährlich erhöhen.") / 100
+    infl = b3.toggle("Inflation abziehen (2 % pro Jahr)", key="sp_infl",
+                     help="Zeigt, was das Geld in heutiger Kaufkraft wert wäre. 100.000 € in 20 Jahren kaufen bei 2 % "
+                          "Inflation nur so viel wie heute etwa 67.000 €.")
+    m = yrs * 12
+    R_ = boot_paths(rp, m)
+    rates = rate * (1 + dyn) ** (np.arange(m) // 12)
+    vals = np.empty_like(R_)
+    v = np.full(R_.shape[0], start_v)
+    for k in range(m):
+        v = (v + rates[k]) * (1 + R_[:, k])
+        vals[:, k] = v
+    paid = start_v + np.cumsum(rates)
+    if infl:
+        defl = (1.02) ** (np.arange(1, m + 1) / 12)
+        vals, paid = vals / defl, paid / defl
+    x = np.arange(1, m + 1) / 12
+    end_ = vals[:, -1]
+    med, p5, p95 = np.median(end_), np.percentile(end_, 5), np.percentile(end_, 95)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Eingezahlt", eur(paid[-1]), help="Startkapital plus alle Sparraten" + (" (in heutiger Kaufkraft)" if infl else "") + ".")
+    k2.metric("Mittlerer Fall", eur(med), f"+{eur(med - paid[-1])} Ertrag" if med > paid[-1] else None,
+              help="Median aller Simulationen. Ertrag = Endwert minus Eingezahltes.")
+    k3.metric("Schlechter Fall (1 von 20)", eur(p5), help="Nur 5 % der Simulationen enden noch schlechter.")
+    prob = (end_ >= goal_v).mean() if goal_v > 0 else None
+    k4.metric("Ziel erreicht", pc(prob, 0) if prob is not None else "–",
+              help="Anteil der Simulationen, die am Ende mindestens dein Ziel erreichen.")
+    st.subheader("Mögliche Entwicklung", help="Linie = mittlerer Fall, Fläche = Bereich von 9 von 10 Simulationen, "
+                                              "gestrichelt = eingezahltes Geld.")
+    fg = go.Figure(fan(x, vals, "Depot", "#1240e0", "rgba(18,64,224,0.15)"))
+    fg.add_scatter(x=x, y=paid, name="Eingezahlt", line=dict(color="#555", dash="dash", width=2))
+    if goal_v > 0:
+        fg.add_hline(y=goal_v, line_color="#0b7a3b", line_dash="dot", annotation_text="Dein Ziel")
+    fg.update_layout(height=520, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Jahre", yaxis_title="€",
+                     separators=",.", legend=dict(orientation="h", y=-0.15), font=dict(size=15))
+    st.plotly_chart(fg, width="stretch")
+    lines = [f"Mit {eur(start_v)} Start und {eur(rate)} im Monat" + (f" (jährlich +{de(dyn * 100, 0)} %)" if dyn else "")
+             + f" zahlst du in {yrs} Jahren insgesamt **{eur(paid[-1])}** ein. Im mittleren Fall wird daraus "
+             f"**{eur(med)}** – in 9 von 10 Fällen zwischen {eur(p5)} und {eur(p95)}."]
+    if med > paid[-1]:
+        lines.append(f"Davon sind etwa **{pc((med - paid[-1]) / med, 0)} Erträge** (Zinseszins-Effekt): Dein Geld "
+                     "verdient Geld, und dieses Geld verdient wieder Geld. Je länger, desto stärker.")
+    if goal_v > 0:
+        hit = (vals >= goal_v).any(axis=1)
+        first = np.where(hit, (vals >= goal_v).argmax(axis=1) + 1, np.nan)
+        when = np.nanmedian(first) / 12 if hit.mean() >= 0.5 else None
+        lines.append(f"Dein Ziel von {eur(goal_v)} erreichst du in **{pc(prob, 0)} der Fälle**"
+                     + (f", im mittleren Fall nach etwa **{de(when, 1)} Jahren**." if when else ".")
+                     + ("" if prob >= 0.7 else " Um sicherer ans Ziel zu kommen: Rate erhöhen, länger sparen oder das "
+                                               "Ziel anpassen."))
+    lines.append("Grundlage ist die Vergangenheit deiner Aufteilung (" + ch.lower() + "). Lief diese besonders gut, sind "
+                 "die Zahlen zu optimistisch – rechne lieber mit dem schlechten Fall.")
+    explain(lines)
+
+
+# =====================================================================
+# Seite: Entnahmeplan
+# =====================================================================
+def page_withdraw():
+    c = ready()
+    head("Entnahmeplan", "Wie lange reicht dein Geld, wenn du jeden Monat etwas entnimmst – zum Beispiel als "
+                         "Zusatzrente?",
+         "2000 Simulationen mit echten Monatsrenditen deiner Aufteilung. Die Entnahme erfolgt am Monatsanfang. Steuern "
+         "auf Entnahmen sind nicht berücksichtigt.")
+    ch, rp = port_choice(c, "wd_port")
+    a1, a2, a3 = st.columns(3)
+    ss.setdefault("wd_start", float(round(c["V"], -1)))
+    ss.setdefault("wd_rate", float(max(10, round(c["V"] * 0.035 / 12, -1))))
+    start_v = a1.number_input("Startkapital (€)", min_value=0.0, step=1000.0, key="wd_start",
+                              help="Voreingestellt ist dein heutiger Depotwert.")
+    wd = a2.number_input("Monatliche Entnahme (€)", min_value=0.0, step=50.0, key="wd_rate",
+                         help="Wie viel du jeden Monat herausnimmst.")
+    yrs = a3.slider("Wie lange soll es reichen? (Jahre)", 5, 50, key="wd_years")
+    infl = st.toggle("Entnahme jedes Jahr um 2 % erhöhen (Inflationsausgleich)", key="wd_infl",
+                     help="Damit deine Entnahme ihre Kaufkraft behält, steigt sie jährlich um 2 %.")
+    m = yrs * 12
+    R_ = boot_paths(rp, m, seed=33)
+
+    def run(w):
+        v = np.full(R_.shape[0], start_v)
+        out = np.empty_like(R_)
+        alive = np.full(R_.shape[0], m + 1)
+        for k in range(m):
+            wk = w * (1.02 ** (k // 12) if infl else 1)
+            v = np.maximum(v - wk, 0) * (1 + R_[:, k])
+            out[:, k] = v
+            alive = np.where((v <= 0) & (alive > m), k + 1, alive)
+        return out, alive
+
+    vals, alive = run(wd)
+    succ = (alive > m).mean()
+    lo_, hi_ = 0.0, max(start_v / 12, 1.0)
+    for _ in range(25):
+        mid = (lo_ + hi_) / 2
+        if (run(mid)[1] > m).mean() >= 0.9:
+            lo_ = mid
+        else:
+            hi_ = mid
+    safe = lo_
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(f"Reicht {yrs} Jahre", pc(succ, 0), help="Anteil der Simulationen, in denen das Geld bis zum Ende reicht.")
+    k2.metric("Sichere Entnahme", eur(safe) + " / Monat",
+              help=f"Höchste monatliche Entnahme, bei der das Geld in 9 von 10 Simulationen {yrs} Jahre reicht.")
+    k3.metric("Rest im mittleren Fall", eur(np.median(vals[:, -1])), help=f"Was nach {yrs} Jahren im Median übrig ist.")
+    k4.metric("Entnommen gesamt", eur(sum(wd * (1.02 ** (k // 12) if infl else 1) for k in range(m))),
+              help="Summe aller geplanten Entnahmen.")
+    x = np.arange(1, m + 1) / 12
+    st.subheader("Wie sich dein Kapital entwickeln könnte", help="Linie = mittlerer Fall, Fläche = 9 von 10 Simulationen.")
+    fg = go.Figure(fan(x, vals, "Kapital", "#1240e0", "rgba(18,64,224,0.15)"))
+    fg.update_layout(height=480, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Jahre", yaxis_title="€",
+                     separators=",.", legend=dict(orientation="h", y=-0.15), font=dict(size=15))
+    st.plotly_chart(fg, width="stretch")
+    lines = [f"Bei {eur(wd)} pro Monat" + (" (jährlich +2 %)" if infl else "") + f" reicht dein Geld in **{pc(succ, 0)} "
+             f"der Fälle** volle {yrs} Jahre.",
+             f"Die **sichere Entnahme** liegt bei etwa **{eur(safe)} pro Monat** – damit reicht es in 9 von 10 "
+             f"Simulationen. Das sind {pc(safe * 12 / max(start_v, 1))} des Startkapitals pro Jahr."]
+    if succ < 0.9:
+        early = alive[alive <= m]
+        if len(early):
+            lines.append(f"In den schlechten Fällen ist das Geld im Schnitt nach **{de(np.median(early) / 12, 1)} Jahren** "
+                         "aufgebraucht.")
+    lines.append("**Reihenfolge-Risiko:** Ein Crash in den ersten Jahren der Entnahme ist viel gefährlicher als später, weil "
+                 "du dann bei niedrigen Kursen verkaufen musst. Viele halten deshalb 1–2 Jahresentnahmen als Bargeld "
+                 "oder Anleihen bereit.")
+    explain(lines)
+
+
+# =====================================================================
+# Seite: Dividenden
+# =====================================================================
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def get_divs(t):
+    try:
+        s = yf.Ticker(t).dividends
+    except Exception:
+        return None
+    if s is None or len(s) == 0:
+        return None
+    s = pd.Series(pd.to_numeric(s, errors="coerce").values, index=pd.to_datetime(s.index, utc=True)).dropna()
+    return s[s.index >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=372)]
+
+
+MONTHS = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
+
+
+def page_div():
+    c = ready()
+    assets, names, cur, V, dep = c["assets"], c["names"], c["cur"], c["V"], c["dep"]
+    head("Dividenden", "Wie viel Geld zahlen dir deine Wertpapiere jedes Jahr aus – und in welchen Monaten kommt es?",
+         "Grundlage sind die Ausschüttungen der letzten 12 Monate pro Stück (von Yahoo), umgerechnet in Euro. "
+         "Künftige Dividenden können höher, niedriger oder ganz ausfallen.")
+    taxr = ss.tax / 100
+    rows, cal = [], np.zeros((len(assets), 12))
+    with st.spinner("Lade Dividenden …"):
+        for i, t in enumerate(assets):
+            price, cur_ = get_quote(t)
+            fx = get_fx(cur_) or 0
+            pe = price * fx if price else None
+            shares = (dep.loc[t, "qty"] if dep is not None else (cur[i] * V / pe if pe else 0))
+            dv = get_divs(t)
+            per_share = float(dv.sum()) if dv is not None else 0.0
+            if dv is not None:
+                for ts, amt in dv.items():
+                    cal[i, ts.month - 1] += amt * shares * fx
+            year_eur = per_share * shares * fx
+            yld = per_share * fx / pe if pe else None
+            yoc = (per_share * fx / dep.loc[t, "cost"]) if dep is not None and dep.loc[t, "cost"] > 0 else None
+            rows.append({"n": names[i], "year": year_eur, "yld": yld, "yoc": yoc, "count": 0 if dv is None else len(dv),
+                         "months": "" if dv is None else ", ".join(sorted({MONTHS[d.month - 1] for d in dv.index},
+                                                                          key=MONTHS.index))})
+    tot = sum(r["year"] for r in rows)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Dividenden pro Jahr (brutto)", eur(tot), help="Summe aller Ausschüttungen der letzten 12 Monate, "
+                                                             "hochgerechnet auf deine heutigen Stückzahlen.")
+    k2.metric("Nach Steuern ca.", eur(tot * (1 - taxr)), help=f"Mit deinem Steuersatz von {de(ss.tax, 1)} % (einstellbar "
+                                                              "auf Übersicht & Vorschlag), ohne Freibetrag.")
+    k3.metric("Ø pro Monat (netto)", eur(tot * (1 - taxr) / 12), help="Netto-Dividenden geteilt durch 12.")
+    k4.metric("Dividendenrendite Depot", pc(tot / V if V else 0), help="Jährliche Dividenden im Verhältnis zum Depotwert.")
+    st.subheader("Dividenden-Kalender", help="In welchen Monaten in den letzten 12 Monaten ausgezahlt wurde – als "
+                                             "Erwartung für die nächsten 12 Monate.")
+    fg = go.Figure([go.Bar(x=MONTHS, y=cal[i], name=names[i]) for i in range(len(assets)) if cal[i].sum() > 0])
+    fg.update_layout(barmode="stack", height=420, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="€ (brutto)",
+                     separators=",.", legend=dict(orientation="h", y=-0.15), font=dict(size=15))
+    st.plotly_chart(fg, width="stretch")
+    TC = st.column_config.TextColumn
+    st.dataframe(pd.DataFrame({"Wertpapier": [r["n"] for r in rows], "Pro Jahr": [eur(r["year"]) for r in rows],
+                               "Rendite": [pct_or(r["yld"]) for r in rows],
+                               "Auf deinen Kaufkurs": [pct_or(r["yoc"]) for r in rows],
+                               "Zahlungen": [r["count"] for r in rows], "Monate": [r["months"] or "–" for r in rows]}),
+                 hide_index=True, width="stretch", column_config={
+                     "Rendite": TC(help="Dividende pro Jahr geteilt durch den heutigen Kurs."),
+                     "Auf deinen Kaufkurs": TC(help="Dividende pro Jahr geteilt durch deinen Kaufkurs (Yield on Cost). "
+                                                    "Nur bei genauer Eingabe.")})
+    payers = [r for r in rows if r["year"] > 0]
+    lines = [f"Deine Wertpapiere schütten zusammen etwa **{eur(tot)} pro Jahr** aus, nach Steuern rund "
+             f"**{eur(tot * (1 - taxr))}** – im Schnitt {eur(tot * (1 - taxr) / 12)} pro Monat."]
+    if payers:
+        top = max(payers, key=lambda r: r["year"])
+        lines.append(f"Größter Zahler: **{top['n']}** mit {eur(top['year'])} pro Jahr.")
+        empty = [MONTHS[k] for k in range(12) if cal[:, k].sum() == 0]
+        if empty and len(empty) < 12:
+            lines.append("Monate ohne Ausschüttung: " + ", ".join(empty) + ".")
+    nopay = [r["n"] for r in rows if r["year"] == 0]
+    if nopay:
+        lines.append("Keine Dividende: " + ", ".join(nopay) + ". Bei thesaurierenden ETFs ist das normal – sie legen die "
+                     "Erträge automatisch wieder an, das steckt im Kurs.")
+    lines.append("Wichtig: Dividenden sind kein Geschenk. Am Tag der Ausschüttung sinkt der Kurs ungefähr um den "
+                 "ausgezahlten Betrag. Entscheidend ist der Gesamtertrag aus Kursgewinn **und** Dividende.")
+    explain(lines)
+
+
+# =====================================================================
+# Seite: PDF-Bericht
+# =====================================================================
+def crisis_losses(assets, w):
+    RL = long_returns(assets)
+    out = []
+    for name, a, b, _ in CRISES:
+        if RL.empty:
+            break
+        win_ = RL.loc[(RL.index > pd.Period(a, "M")) & (RL.index <= pd.Period(b, "M"))]
+        avail = [i for i, t in enumerate(assets) if t in win_ and len(win_) and win_[t].notna().all()]
+        cov = float(sum(w[i] for i in avail))
+        if not avail or cov < 0.3:
+            out.append((name, None, cov))
+            continue
+        ww = np.array([w[i] for i in avail]) / cov
+        out.append((name, float(np.prod(1 + win_[[assets[i] for i in avail]].values @ ww) - 1), cov))
+    return out
+
+
+def build_pdf(c, with_stress):
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from fpdf import FPDF
+    fdir = os.path.join(os.path.dirname(matplotlib.__file__), "mpl-data", "fonts", "ttf")
+    pdf = FPDF()
+    pdf.add_font("DV", "", os.path.join(fdir, "DejaVuSans.ttf"))
+    pdf.add_font("DV", "B", os.path.join(fdir, "DejaVuSans-Bold.ttf"))
+    pdf.set_auto_page_break(True, 15)
+    pdf.add_page()
+    BLUE = (18, 64, 224)
+
+    def h1(t):
+        pdf.set_font("DV", "B", 20)
+        pdf.set_text_color(*BLUE)
+        pdf.multi_cell(0, 10, t, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+
+    def h2(t, need=40):
+        if pdf.get_y() > pdf.h - 15 - need:      # Überschrift nicht allein am Seitenende
+            pdf.add_page()
+        pdf.ln(3)
+        pdf.set_font("DV", "B", 13)
+        pdf.set_text_color(*BLUE)
+        pdf.multi_cell(0, 8, t, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+
+    def p(t, size=10):
+        pdf.set_font("DV", "", size)
+        pdf.multi_cell(0, 5.5, t, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+
+    def table(head_, rows_, widths=None):
+        pdf.set_font("DV", "", 9)
+        with pdf.table(col_widths=widths, text_align="LEFT", line_height=6,
+                       headings_style=__import__("fpdf").FontFace(emphasis="BOLD", fill_color=(230, 235, 250))) as tb:
+            r_ = tb.row()
+            for x in head_:
+                r_.cell(str(x))
+            for row in rows_:
+                r_ = tb.row()
+                for x in row:
+                    r_.cell(str(x))
+        pdf.ln(2)
+
+    def fig_to_pdf(fig, h=70):
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        pdf.image(buf, w=180, h=h, keep_aspect_ratio=True)
+        pdf.ln(2)
+
+    assets, names, cur, tw, V, M, target = c["assets"], c["names"], c["cur"], c["tw"], c["V"], c["M"], c["target"]
+    tm, cm = M[target], M["Aktuell"]
+    h1("Portfolio-Check – Bericht")
+    p(f"Erstellt am {date.today().strftime('%d.%m.%Y')} · Ziel: {c['goal_txt']} · ausgewertet: {c['R'].index[0]} bis "
+      f"{c['R'].index[-1]} ({c['T']} Monate) · Depotwert {eur(V)}", 9)
+    h2("Auf einen Blick")
+    p(f"Dein Portfolio ist {lvl_vol(cm['Vol. p.a.'])} (Schwankung {pc(cm['Vol. p.a.'])}). Es ist im Schnitt um "
+      f"{pc(cm['Rendite p.a.'])} pro Jahr gewachsen; der schlimmste Einbruch lag bei −{pc(cm['Max. Drawdown'])}. "
+      f"Das Verhältnis von Gewinn zu Risiko war {lvl_sh(cm['Sharpe'])}.")
+    table(["Kennzahl", "Jetziges Portfolio", "Vorschlag"],
+          [["Ø Gewinn pro Jahr", pc(cm["Rendite p.a."]), pc(tm["Rendite p.a."])],
+           ["Schwankung", pc(cm["Vol. p.a."]), pc(tm["Vol. p.a."])],
+           ["Schlimmster Absturz", "−" + pc(cm["Max. Drawdown"]), "−" + pc(tm["Max. Drawdown"])],
+           ["Gewinn pro Risiko (Sharpe)", de(cm["Sharpe"], 2), de(tm["Sharpe"], 2)]], (60, 50, 50))
+    dep = c["dep"]
+    if dep is not None and dep["qty"].sum() > 0:
+        h2("Dein Depot")
+        rows_ = []
+        for t, n in zip(assets, names):
+            r_ = dep.loc[t]
+            if r_["qty"] <= 0:
+                continue
+            g = r_["gain"]
+            rows_.append([n, de(r_["qty"], 2), eur2(r_["cost"]) if r_["cost"] else "–", eur2(r_["price_eur"]),
+                          eur(r_["value"]), ("+" if g >= 0 else "−") + eur(abs(g)) if g is not None and g == g else "–",
+                          (sg(r_["gain_pct"] * 100) + " %") if r_["gain_pct"] is not None and r_["gain_pct"] == r_["gain_pct"] else "–"])
+        table(["Wertpapier", "Stück", "Ø Kaufkurs", "Kurs", "Wert", "Gewinn/Verlust", "in %"], rows_,
+              (50, 18, 24, 24, 24, 26, 18))
+    h2(f"Vorschlag zur Umschichtung ({c['goal_txt']})")
+    cur_v = cur * V
+    newm, nosell = float(ss.get("newmoney") or 0), bool(ss.get("nosell"))
+    d_eur = plan(cur_v, tw, newm, nosell)
+    thr = 0.005 * max(V + newm, 1)
+    table(["Wertpapier", "Jetzt", "Nachher", "Was tun?"],
+          [[n, eur(a), eur(a + d), "behalten" if abs(d) < thr else (f"+{eur(d)} kaufen" if d > 0 else f"−{eur(-d)} verkaufen")]
+           for n, a, d in zip(names, cur_v, d_eur)], (60, 35, 35, 50))
+    if newm or nosell:
+        p(f"Mit {eur(newm)} neuem Geld" + (", ohne Verkäufe (nur nachkaufen)." if nosell else "."), 9)
+    fig, ax = plt.subplots(figsize=(8, 0.5 + 0.45 * len(names)))
+    yy = np.arange(len(names))
+    ax.barh(yy + 0.2, cur * 100, 0.4, label="Jetzt", color="#b8c4e8")
+    ax.barh(yy - 0.2, tw * 100, 0.4, label="Vorschlag", color="#1240e0")
+    ax.set_yticks(yy, names)
+    ax.invert_yaxis()
+    ax.set_xlabel("Anteil in %")
+    ax.legend(loc="lower right")
+    ax.spines[["top", "right"]].set_visible(False)
+    fig_to_pdf(fig, h=min(110, 20 + 9 * len(names)))
+    h2("So hätte sich dein Geld entwickelt", need=95)
+    R = c["R"]
+    fig, ax = plt.subplots(figsize=(8, 3.4))
+    ax.plot(R.index.to_timestamp(), V * np.cumprod(1 + R.values @ cur), color="#e8361b", lw=2, label="Jetziges Portfolio")
+    ax.plot(R.index.to_timestamp(), V * np.cumprod(1 + R.values @ tw), color="#1240e0", lw=2, label="Vorschlag")
+    ax.set_ylabel("€")
+    ax.legend()
+    ax.spines[["top", "right"]].set_visible(False)
+    fig_to_pdf(fig, h=75)
+    p("Hinweis: Der Vorschlag ist mit genau diesen Kursen berechnet und sieht hier deshalb besonders gut aus.", 8)
+    h2("Realitäts-Check (Backtest)")
+    BT = c["BT"]
+    if BT is None or target not in BT:
+        p("Zu wenig Kursgeschichte für den Test.")
+    else:
+        a, b = BT["Aktuell"]["Sharpe"], BT[target]["Sharpe"]
+        p(("Ja – " if b > a + 0.05 else "Kaum Unterschied – " if b >= a - 0.05 else "Nein – ")
+          + f"im Testzeitraum ({R.index[c['s_']]} bis {R.index[-1]}), den der Vorschlag nicht kannte, lag das Verhältnis "
+            f"von Gewinn zu Risiko bei {de(b, 2)} (Vorschlag) gegenüber {de(a, 2)} (jetziges Portfolio).")
+    h2(f"Zukunftssimulation: {hor} Jahre")
+    S_ = c["SIM"]
+    table(["", "Schlechter Fall (5 %)", "Mittlerer Fall", "Guter Fall (95 %)", "Risiko im Minus"],
+          [[lab, eur(S_[k]["5 %"]), eur(S_[k]["Median"]), eur(S_[k]["95 %"]), pc(S_[k]["P(Verlust)"], 0)]
+           for lab, k in (("Jetziges Portfolio", "Aktuell"), ("Vorschlag", target))], (40, 36, 34, 36, 34))
+    if with_stress:
+        h2("Krisen-Stresstest")
+        cl = crisis_losses(assets, cur)
+        table(["Krise", "Verlust deines Depots", "in €", "Abgedeckt"],
+              [[n, pc(l, 0) if l is not None else "keine Daten", ("−" + eur(-l * V)) if l is not None and l < 0 else "–",
+                pc(cv, 0)] for n, l, cv in cl], (60, 45, 40, 35))
+    h2("Wichtige Hinweise")
+    p("Alle Zahlen beruhen auf vergangenen Kursen (Yahoo Finance). Was früher gut lief, muss nicht so weiterlaufen. "
+      "Gebühren, Steuern und Wechselkurseffekte sind nur teilweise berücksichtigt. Dieser Bericht ist keine "
+      "Anlageberatung.", 9)
+    return bytes(pdf.output())
+
+
+def page_report():
+    head("PDF-Bericht", "Die wichtigsten Ergebnisse als PDF – zum Ausdrucken, Abspeichern oder Weiterschicken.",
+         "Der Bericht nutzt deine aktuellen Eingaben und Einstellungen (Ziel, Zeitraum, neues Geld, nur nachkaufen).")
+    c = ready()
+    st.markdown("**Inhalt:** Auf einen Blick · Dein Depot (bei genauer Eingabe) · Vorschlag zur Umschichtung mit "
+                "Grafik · Wertentwicklung · Realitäts-Check · Zukunftssimulation · optional Krisen-Stresstest · Hinweise")
+    ws = st.checkbox("Krisen-Stresstest einbeziehen", key="rep_stress",
+                     help="Lädt lange Kurshistorien – beim ersten Mal dauert der Bericht dann etwas länger.")
+    if st.button("Bericht erstellen", type="primary", icon=":material/picture_as_pdf:"):
+        with st.spinner("Erstelle Bericht …"):
+            try:
+                ss.pdf = build_pdf(c, ws)
+                ss.pdf_err = None
+            except Exception as e:
+                ss.pdf, ss.pdf_err = None, str(e)
+    if ss.get("pdf_err"):
+        st.error(f"Der Bericht konnte nicht erstellt werden: {ss.pdf_err}")
+    if ss.get("pdf"):
+        st.success("Fertig! Dein Bericht ist bereit.")
+        st.download_button("PDF herunterladen", ss.pdf, file_name=f"portfolio-bericht-{date.today().isoformat()}.pdf",
+                           mime="application/pdf", icon=":material/download:", on_click="ignore", type="primary")
+        st.caption("Ändern sich deine Eingaben, erstell den Bericht einfach neu.")
+
+
+# =====================================================================
 # Menü
 # =====================================================================
 P_INPUT = st.Page(page_input, title="Mein Portfolio", icon=":material/edit:", url_path="portfolio", default=True)
@@ -2038,14 +2719,21 @@ P_COMP = st.Page(page_compare, title="Strategievergleich", icon=":material/table
 P_HELP = st.Page(page_help, title="Begriffe & Hilfe", icon=":material/help:", url_path="hilfe")
 P_INFO = st.Page(page_info, title="Unternehmensdaten", icon=":material/apartment:", url_path="unternehmensdaten")
 P_IMPROVE = st.Page(page_improve, title="Portfolio verbessern", icon=":material/lightbulb:", url_path="verbessern")
+P_STRESS = st.Page(page_stress, title="Krisen-Stresstest", icon=":material/thunderstorm:", url_path="stresstest")
+P_VSM = st.Page(page_vs_market, title="Vergleich mit dem Markt", icon=":material/compare_arrows:", url_path="markt")
+P_SAVE = st.Page(page_savings, title="Sparplan-Rechner", icon=":material/savings:", url_path="sparplan")
+P_WD = st.Page(page_withdraw, title="Entnahmeplan", icon=":material/payments:", url_path="entnahme")
+P_DIV = st.Page(page_div, title="Dividenden", icon=":material/paid:", url_path="dividenden")
+P_PDF = st.Page(page_report, title="PDF-Bericht", icon=":material/picture_as_pdf:", url_path="bericht")
 P_NEWS = st.Page(page_news, title="Nachrichten", icon=":material/newspaper:", url_path="nachrichten")
 
 menu = {"Start": [P_INPUT, P_DEPOT, P_OVER],
         "Simulationen & Analysen": [P_GROWTH, P_ASSETS, P_RISK, P_FUTURE, P_CHECK],
+        "Planen & Testen": [P_STRESS, P_VSM, P_SAVE, P_WD, P_DIV],
         "Infos & Ideen": [P_IMPROVE, P_INFO, P_NEWS]}
 if expert:
     menu["Experten"] = [P_FRONT, P_STYLE, P_COMP]
-menu["Hilfe"] = [P_HELP]
+menu["Bericht & Hilfe"] = [P_PDF, P_HELP]
 pg = st.navigation(menu)
 pg.run()
 with st.sidebar.expander("Depot speichern & laden", icon=":material/save:"):
